@@ -1,5 +1,10 @@
 # Vanta IDE
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-purple.svg)](./LICENSE)
+[![Platform: Windows 11](https://img.shields.io/badge/Platform-Windows%2011%20WebView2-blue.svg)](https://github.com/imwiffer/vanta-ide)
+[![Editor: Monaco](https://img.shields.io/badge/Editor-Monaco%200.57-orange.svg)](https://microsoft.github.io/monaco-editor/)
+[![Integration: Agentic OS](https://img.shields.io/badge/Integration-Agentic%20OS-emerald.svg)](https://github.com/imwiffer/agentic-os)
+
 A local-first, single-process IDE that runs in its own window. Python stdlib on
 the back end, a bundled Monaco editor on the front, WebView2 hosting the whole
 thing as a native app — no browser chrome, no tabs but the editor's own. No
@@ -265,10 +270,25 @@ node build.mjs
 Verify a build without clicking anything:
 
 ```powershell
-.\.venv\Scripts\python.exe ide\desktop.py --selftest
+python desktop.py --selftest
 ```
 
 It creates a hidden window, opens a file, checks Monaco mounted, the tree
 rendered, the terminal started, the JS bridge answered, the close guard fired
 on a dirty buffer — then prints JSON and exits `0` (or `2` on failure).
+
+---
+
+## Recent Progress & Architecture Milestones
+
+* **Standalone Project Separation:** Decoupled completely from parent workspaces into a first-class repository at [imwiffer/vanta-ide](https://github.com/imwiffer/vanta-ide) with dedicated `.gitignore`, MIT license, standalone launchers, and self-contained logging.
+* **Autonomous Multi-Model Agent Harness (`tools/agent_tools.py`):** Real-time tool execution (`read_file`, `write_file`, `edit_file`, `list_dir`, `search_files`, `run_command`) with native adaptive parsers for Qwen (`<tool_call>`), Llama 3 (`<|python_tag|>`), DeepSeek-R1 (with thought stripping), and universal text-based ACTION blocks.
+* **Hybrid GPU & AirLLM Engine:** Direct Blackwell RTX 5070 fp16/4-bit acceleration via PyTorch cu128 with automated NVMe disk-layer streaming fallback (AirLLM) for ultra-large models (70B+).
+* **Console-Free Native Windowing:** Pure WebView2 runtime integration with zero console flash (`run.vbs`, `run-admin.cmd`), dark DWM captions, and native Windows folder picker bridges.
+* **Agentic OS Integration:** Functions as the primary desktop development cockpit and GPU compute bridge for [imwiffer/agentic-os](https://github.com/imwiffer/agentic-os).
+
+---
+
+## License
+Released under the [MIT License](./LICENSE).
 
