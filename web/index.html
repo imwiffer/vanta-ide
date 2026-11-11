@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Vanta IDE</title>
+<link rel="stylesheet" href="/vendor/monaco.css" />
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+<div id="app">
+
+  <!-- ============================ title bar ============================ -->
+  <div id="titlebar">
+    <div class="brand" title="Vanta IDE">
+      <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+        <path d="M3 4l9 17 9-17h-3.4L12 16.2 6.4 4H3z" fill="currentColor"/>
+      </svg>
+      <span>VANTA</span>
+    </div>
+    <nav id="menubar">
+      <button data-menu="file">File</button>
+      <button data-menu="edit">Edit</button>
+      <button data-menu="view">View</button>
+      <button data-menu="go">Go</button>
+      <button data-menu="run">Run</button>
+      <button data-menu="terminal">Terminal</button>
+      <button data-menu="help">Help</button>
+    </nav>
+    <div class="titlebar-mid">
+      <button id="quickOpenBtn" class="omni" title="Search files (Ctrl+P)">
+        <svg viewBox="0 0 24 24" width="13" height="13"><path d="M10 4a6 6 0 104.47 10.03l4.75 4.75 1.41-1.41-4.75-4.75A6 6 0 0010 4zm0 2a4 4 0 110 8 4 4 0 010-8z" fill="currentColor"/></svg>
+        <span id="omniText">Search files, commands…</span>
+        <kbd>Ctrl P</kbd>
+      </button>
+    </div>
+    <div class="titlebar-right">
+      <span id="projectChip" class="chip">no folder</span>
+      <button id="btnReload" class="icon-btn" title="Reload window">⟳</button>
+    </div>
+  </div>
+
+  <div id="workbench">
+
+    <!-- ============================ activity ============================ -->
+    <div id="activity">
+      <button class="act active" data-view="explorer" title="Explorer (Ctrl+Shift+E)">
+        <svg viewBox="0 0 24 24"><path d="M3 5h6l2 2h10v12H3z" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>
+      </button>
+      <button class="act" data-view="search" title="Search (Ctrl+Shift+F)">
+        <svg viewBox="0 0 24 24"><path d="M10.5 4a6.5 6.5 0 104.9 10.7l4.4 4.4 1.2-1.2-4.4-4.4A6.5 6.5 0 0010.5 4zm0 1.8a4.7 4.7 0 110 9.4 4.7 4.7 0 010-9.4z" fill="currentColor"/></svg>
+      </button>
+      <button class="act" data-view="scm" title="Source control">
+        <svg viewBox="0 0 24 24"><path d="M7 3v9a4 4 0 004 4h4m0 0a3 3 0 11-3-3 3 3 0 013 3zm0-11a2.5 2.5 0 110 5 2.5 2.5 0 010-5z" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>
+        <span id="scmBadge" class="badge hidden">0</span>
+      </button>
+      <button class="act" data-view="ai" title="Chat dock (Ctrl+J)">
+        <svg viewBox="0 0 24 24"><path d="M5 5h14v9H12l-4 4v-4H5z" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="9" cy="9.5" r="1" fill="currentColor"/><circle cx="12.5" cy="9.5" r="1" fill="currentColor"/><circle cx="16" cy="9.5" r="1" fill="currentColor"/></svg>
+      </button>
+      <div class="act-spacer"></div>
+      <button class="act" data-view="project" title="Projects">
+        <svg viewBox="0 0 24 24"><path d="M4 6h7l2 3h7v10H4z" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M8 3h8v3" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>
+      </button>
+    </div>
+
+    <!-- ============================ sidebar ============================ -->
+    <aside id="sidebar">
+      <section data-panel="explorer" class="side visible">
+        <header class="side-head">
+          <span>EXPLORER</span>
+          <div class="side-actions">
+            <button id="btnNewFile" title="New file">+</button>
+            <button id="btnNewFolder" title="New folder">▤</button>
+            <button id="btnRefreshTree" title="Refresh">⟳</button>
+            <button id="btnCollapseAll" title="Collapse all">⌄</button>
+          </div>
+        </header>
+        <div id="rootRow" class="root-row hidden"></div>
+        <div id="tree" class="tree"></div>
+        <div id="treeEmpty" class="side-empty">No folder open.<br />Open one to begin.</div>
+      </section>
+
+      <section data-panel="search" class="side">
+        <header class="side-head"><span>SEARCH</span></header>
+        <div class="pad">
+          <input id="searchInput" class="input" placeholder="Search across files…" />
+          <div class="row gap6">
+            <input id="searchInclude" class="input grow" placeholder="files to include (e.g. *.ts)" />
+            <button id="searchCase" class="toggle" title="Match case">Aa</button>
+            <button id="searchRegex" class="toggle" title="Use regex">.*</button>
+          </div>
+          <button id="searchRun" class="btn primary full">Search</button>
+          <div id="searchMeta" class="meta"></div>
+          <div id="searchResults" class="results"></div>
+        </div>
+      </section>
+
+      <section data-panel="scm" class="side">
+        <header class="side-head">
+          <span>SOURCE CONTROL</span>
+          <div class="side-actions"><button id="btnGitRefresh" title="Refresh">⟳</button></div>
+        </header>
+        <div class="pad">
+          <div id="gitBranchRow" class="meta">—</div>
+          <div id="gitChanges" class="results"></div>
+          <div id="gitCommitBox" class="commit-box">
+            <textarea id="gitMessage" rows="3" placeholder="Commit message (Ctrl+Enter)"></textarea>
+            <button id="btnCommit" class="btn primary full">Commit all changes</button>
+            <div id="gitCommitOut" class="meta"></div>
+          </div>
+        </div>
+      </section>
+
+      <section data-panel="project" class="side">
+        <header class="side-head"><span>PROJECTS</span></header>
+        <div class="pad stack">
+          <button id="btnOpenFolder2" class="btn primary full">Open Folder…</button>
+          <label class="label">Recent</label>
+          <div id="recentList" class="results"></div>
+          <label class="label">Machine</label>
+          <div id="machineInfo" class="meta small"></div>
+        </div>
+      </section>
+    </aside>
+
+    <!-- ============================ main ============================ -->
+    <main id="main">
+    <div id="mainCol">
+      <div id="tabs" class="tabs"></div>
+      <div id="breadcrumbs" class="crumbs"></div>
+
+      <div id="editorHost">
+        <div id="welcome" class="welcome">
+          <div class="welcome-inner">
+            <div class="logo-word">VANTA</div>
+            <div class="logo-sub">a quiet bench for loud projects</div>
+            <div class="welcome-grid">
+              <div class="wcard">
+                <h3>Start</h3>
+                <button id="welcomeOpen" class="btn primary full">Open Folder</button>
+                <div id="welcomeRecent" class="recent-mini"></div>
+              </div>
+              <div class="wcard">
+                <h3>Shortcuts</h3>
+                <ul class="keys">
+                  <li><kbd>Ctrl P</kbd><span>go to file</span></li>
+                  <li><kbd>Ctrl Shift P</kbd><span>command palette</span></li>
+                  <li><kbd>Ctrl Shift F</kbd><span>search in files</span></li>
+                  <li><kbd>Ctrl `</kbd><span>terminal</span></li>
+                  <li><kbd>F5</kbd><span>run current file</span></li>
+                  <li><kbd>Ctrl S</kbd><span>save</span></li>
+                </ul>
+              </div>
+              <div class="wcard">
+                <h3>Chat</h3>
+                <pre class="mini-code">provider: local | api
+mode: chat · explain · edit
+      review · plan</pre>
+                <p class="meta small">The chat dock sits right of the terminal — Ctrl+J. Local runs AirLLM on this GPU; API talks to any OpenAI-compatible endpoint.</p>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div id="editor"></div>
+        <div id="diffHost" class="hidden"></div>
+        <div id="fileBanner" class="banner hidden"></div>
+      </div>
+
+      <div id="panel">
+        <div id="panelTabs">
+          <button class="ptab active" data-ptab="terminal">TERMINAL</button>
+          <button class="ptab" data-ptab="output">OUTPUT</button>
+          <span id="termAdminBadge" class="chip-admin hidden" title="Running with Administrator privileges">ADMIN</span>
+          <div class="spacer"></div>
+          <span id="termCwd" class="meta small"></span>
+          <button id="btnTermElevate" class="icon-btn" title="Restart Vanta IDE with Administrator privileges">⚡</button>
+          <button id="btnTermNew" class="icon-btn" title="New terminal">+</button>
+          <button id="btnTermClear" class="icon-btn" title="Clear">⌫</button>
+          <button id="btnTermStop" class="icon-btn" title="Stop / restart shell">■</button>
+          <button id="btnPanelClose" class="icon-btn" title="Close panel">✕</button>
+        </div>
+        <div id="panelBody">
+          <div id="termPane" class="pane">
+            <pre id="termOut"></pre>
+            <div class="term-line">
+              <span class="prompt-mark">❯</span>
+              <input id="termInput" spellcheck="false" autocomplete="off" />
+            </div>
+          </div>
+          <div id="outputPane" class="pane hidden">
+            <pre id="outputText"></pre>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="dockRz" class="rz rz-v" title="Resize chat"></div>
+
+    <!-- ============================ chat dock ============================ -->
+    <aside id="chatDock" class="closed">
+      <header id="chatHead">
+        <span class="dock-title">CHAT</span>
+        <span id="chatTag" class="dock-tag api">vps · ollama</span>
+        <div class="dock-actions">
+          <button id="btnChatSettings" title="Chat settings">⚙</button>
+          <button id="btnChatReset" title="Clear chat / unload model">✕</button>
+          <button id="btnChatClose" title="Hide chat (Ctrl+J)">⟩</button>
+        </div>
+      </header>
+
+      <div id="chatSettings" class="dock-settings hidden">
+        <label class="label">Primary Engine</label>
+        <div class="seg" id="chatProvider">
+          <button class="seg-btn active" data-provider="api">remote · Ollama VPS</button>
+          <button class="seg-btn" data-provider="local">local · AirLLM (failsafe)</button>
+        </div>
+
+        <div id="chatApiGroup" class="stack">
+          <label class="label">VPS / Ollama Endpoint</label>
+          <input id="chatApiBase" class="input" list="chatPeerList" spellcheck="false" placeholder="http://100.120.101.8:11434/v1" />
+          <datalist id="chatPeerList"></datalist>
+          <label class="label">API key (optional for Ollama)</label>
+          <input id="chatApiKey" class="input" type="password" autocomplete="off" spellcheck="false" placeholder="optional — saved to ide/.ai.json" />
+          <label class="label">Remote model</label>
+          <div class="row gap6">
+            <select id="chatApiModel" class="input grow"><option value="">auto (first available on VPS)</option></select>
+            <button id="btnChatFetch" class="btn" title="Fetch models from VPS Ollama">⟳</button>
+          </div>
+          <label class="check"><input id="chatFailsafe" type="checkbox" checked /> auto-failsafe to local AirLLM if VPS is unreachable</label>
+          <label class="check"><input id="chatClearKey" type="checkbox" /> forget the saved key</label>
+        </div>
+
+        <div id="chatLocalGroup" class="stack hidden">
+          <label class="label">Local failsafe model (AirLLM)</label>
+          <div class="row gap6">
+            <input id="chatLocalModel" class="input grow" list="chatLocalList" spellcheck="false" />
+            <datalist id="chatLocalList"></datalist>
+            <button id="btnChatLoad" class="btn" title="Pre-load this checkpoint through AirLLM">Load</button>
+          </div>
+          <select id="chatCompression" class="input" title="Precision — auto fits the checkpoint to free VRAM">
+            <option value="">auto (fit to VRAM)</option>
+            <option value="8bit">8-bit (forced)</option>
+            <option value="4bit">4-bit (forced)</option>
+          </select>
+        </div>
+
+        <label class="label">Mode</label>
+        <select id="chatMode" class="input">
+          <option value="agent">agent — autonomous tools (read/write/exec)</option>
+          <option value="chat">chat — conversation + code</option>
+          <option value="code">code — build it, full file</option>
+          <option value="explain">explain — walk the code</option>
+          <option value="edit">edit — rewrite the selection</option>
+          <option value="review">review — bugs, risks, fixes</option>
+          <option value="plan">plan — ordered steps</option>
+        </select>
+
+        <div class="row gap6">
+          <span class="meta small">temp</span>
+          <input id="chatTemp" class="input" type="number" min="0" max="2" step="0.1" value="0.7" style="width:70px" />
+          <span class="meta small">max tokens</span>
+          <input id="chatMax" class="input" type="number" min="16" max="8192" step="16" value="512" style="width:82px" />
+        </div>
+        <label class="check"><input id="chatContext" type="checkbox" checked /> attach active file + selection</label>
+        <label class="check"><input id="chatAgentTools" type="checkbox" checked /> autonomous agent tools (read, write, edit, terminal)</label>
+        <div id="chatHint" class="meta small">Local runs on this machine's GPU. Agent tools let any model read, write, edit files and run PowerShell commands autonomously.</div>
+      </div>
+
+      <div id="chatLog" class="chat-log"></div>
+
+      <div id="chatComposer" class="composer">
+        <textarea id="chatInput" rows="3" placeholder="Ask the model… · Ctrl+Enter sends · the active selection rides along"></textarea>
+        <div class="row gap6">
+          <span id="chatState" class="meta small grow">idle</span>
+          <button id="btnChatApply" class="btn hidden" title="Replace the selection with this reply">Apply</button>
+          <button id="btnChatSend" class="btn primary">Send</button>
+        </div>
+      </div>
+    </aside>
+    </main>
+  </div>
+
+  <!-- ============================ status bar ============================ -->
+  <footer id="statusbar">
+    <div class="sb-left">
+      <span id="sbBranch" class="sb-item" title="branch">⑂ —</span>
+      <span id="sbProject" class="sb-item">no folder</span>
+      <span id="sbAi" class="sb-item" title="chat provider">chat: local</span>
+    </div>
+    <div class="sb-right">
+      <span id="sbGpu" class="sb-item" title="gpu"></span>
+      <span id="sbCursor" class="sb-item">Ln 1, Col 1</span>
+      <span id="sbIndent" class="sb-item">Spaces: 4</span>
+      <span id="sbEncoding" class="sb-item">UTF-8</span>
+      <span id="sbEol" class="sb-item">CRLF</span>
+      <span id="sbLang" class="sb-item">plaintext</span>
+    </div>
+  </footer>
+</div>
+
+<!-- ============================ overlays ============================ -->
+<div id="overlay" class="overlay hidden">
+  <div class="overlay-box">
+    <input id="overlayInput" class="input" autocomplete="off" spellcheck="false" />
+    <div id="overlayList" class="overlay-list"></div>
+    <div class="overlay-hint"><kbd>↑</kbd><kbd>↓</kbd> navigate · <kbd>Enter</kbd> run · <kbd>Esc</kbd> dismiss</div>
+  </div>
+</div>
+
+<div id="modalWrap" class="overlay hidden">
+  <div class="modal">
+    <div id="modalTitle" class="modal-title"></div>
+    <div id="modalBody" class="modal-body"></div>
+    <div class="modal-actions">
+      <button id="modalCancel" class="btn">Cancel</button>
+      <button id="modalOk" class="btn primary">OK</button>
+    </div>
+  </div>
+</div>
+
+<div id="ctxMenu" class="ctx hidden"></div>
+<div id="menuDrop" class="menu-drop hidden"></div>
+<div id="toast" class="toast hidden"></div>
+
+<script>
+  window.__vantaErrors = [];
+  window.addEventListener('error', (e) => {
+    window.__vantaErrors.push(String(e.message || e.type) + ' @ ' + String(e.filename || '').split('/').pop() + ':' + (e.lineno || 0));
+  });
+  window.addEventListener('unhandledrejection', (e) => {
+    window.__vantaErrors.push('reject: ' + String(e.reason && e.reason.message || e.reason));
+  });
+  self.MonacoEnvironment = {
+    getWorkerUrl: function (moduleId, label) {
+      if (label === 'json') return '/vendor/workers/json.js';
+      if (label === 'css' || label === 'scss' || label === 'less') return '/vendor/workers/css.js';
+      if (label === 'html' || label === 'handlebars' || label === 'razor') return '/vendor/workers/html.js';
+      if (label === 'typescript' || label === 'javascript') return '/vendor/workers/ts.js';
+      return '/vendor/workers/editor.js';
+    }
+  };
+</script>
+<script src="/vendor/monaco.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

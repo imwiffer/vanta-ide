@@ -1,0 +1,14 @@
+{
+  "name": "vanta-ide",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local-first mini IDE served from Python stdlib with a bundled Monaco editor",
+  "scripts": {
+    "build": "node build.mjs",
+    "serve": "python server.py"
+  },
+  "dependencies": {
+    "esbuild": "^0.25.0",
+    "monaco-editor": "^0.57.0"
+  }
+}
