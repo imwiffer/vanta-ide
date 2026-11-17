@@ -90,6 +90,8 @@
             <button id="searchRegex" class="toggle" title="Use regex">.*</button>
           </div>
           <button id="searchRun" class="btn primary full">Search</button>
+          <input id="searchReplace" class="input" placeholder="replace with…" spellcheck="false" />
+          <button id="searchReplaceBtn" class="btn full">Replace All</button>
           <div id="searchMeta" class="meta"></div>
           <div id="searchResults" class="results"></div>
         </div>
@@ -102,7 +104,16 @@
         </header>
         <div class="pad">
           <div id="gitBranchRow" class="meta">—</div>
+          <div class="row gap6" id="gitActions">
+            <select id="gitBranch" class="input grow" title="Switch branch"></select>
+            <button id="btnGitPull" class="btn" title="Pull">⇣</button>
+            <button id="btnGitPush" class="btn" title="Push">⇡</button>
+          </div>
           <div id="gitChanges" class="results"></div>
+          <div class="row gap6">
+            <button id="btnGitPRs" class="btn full" title="List GitHub pull requests (gh CLI)">Pull requests</button>
+          </div>
+          <div id="gitPRs" class="results"></div>
           <div id="gitCommitBox" class="commit-box">
             <textarea id="gitMessage" rows="3" placeholder="Commit message (Ctrl+Enter)"></textarea>
             <button id="btnCommit" class="btn primary full">Commit all changes</button>
@@ -117,6 +128,21 @@
           <button id="btnOpenFolder2" class="btn primary full">Open Folder…</button>
           <label class="label">Recent</label>
           <div id="recentList" class="results"></div>
+          <label class="label">Remotes</label>
+          <div id="remoteList" class="results"></div>
+          <label class="label">Open in editor</label>
+          <div id="editorList" class="results"></div>
+          <label class="label">Import</label>
+          <div class="row gap6">
+            <button id="btnImportVscode" class="btn grow">VS Code settings</button>
+            <button id="btnImportSnips" class="btn grow">Snippets</button>
+          </div>
+          <label class="label">Plugins</label>
+          <div id="pluginList" class="results"></div>
+          <div class="row gap6">
+            <button id="btnPluginReload" class="btn grow">Reload plugins</button>
+            <button id="btnUpdateCheck" class="btn grow">Check updates</button>
+          </div>
           <label class="label">Machine</label>
           <div id="machineInfo" class="meta small"></div>
         </div>
@@ -163,6 +189,7 @@ mode: chat · explain · edit
         </div>
         <div id="editor"></div>
         <div id="diffHost" class="hidden"></div>
+        <div id="mdPreview" class="md-preview hidden"></div>
         <div id="fileBanner" class="banner hidden"></div>
       </div>
 
@@ -170,6 +197,7 @@ mode: chat · explain · edit
         <div id="panelTabs">
           <button class="ptab active" data-ptab="terminal">TERMINAL</button>
           <button class="ptab" data-ptab="output">OUTPUT</button>
+          <button class="ptab" data-ptab="debug">DEBUG</button>
           <span id="termAdminBadge" class="chip-admin hidden" title="Running with Administrator privileges">ADMIN</span>
           <div class="spacer"></div>
           <span id="termCwd" class="meta small"></span>
@@ -189,6 +217,31 @@ mode: chat · explain · edit
           </div>
           <div id="outputPane" class="pane hidden">
             <pre id="outputText"></pre>
+          </div>
+          <div id="debugPane" class="pane hidden">
+            <div id="dbgBar" class="row gap6 dbg-bar hidden">
+              <button id="dbgContinue" class="btn" title="Continue">▶</button>
+              <button id="dbgNext" class="btn" title="Step over">↷</button>
+              <button id="dbgStepIn" class="btn" title="Step into">⤵</button>
+              <button id="dbgStepOut" class="btn" title="Step out">⤴</button>
+              <button id="dbgStop" class="btn danger" title="Stop">■</button>
+              <span id="dbgState" class="meta small grow"></span>
+            </div>
+            <div class="dbg-cols">
+              <div class="dbg-col">
+                <div class="meta small dbg-head">CALL STACK</div>
+                <div id="dbgStack" class="results dbg-list"></div>
+              </div>
+              <div class="dbg-col">
+                <div class="meta small dbg-head">VARIABLES</div>
+                <div id="dbgVars" class="results dbg-list"></div>
+                <div class="row gap6 dbg-eval">
+                  <span class="prompt-mark">›</span>
+                  <input id="dbgExpr" class="input grow" placeholder="evaluate in current frame…" spellcheck="false" />
+                </div>
+              </div>
+            </div>
+            <pre id="dbgOutput" class="dbg-out"></pre>
           </div>
         </div>
       </div>
@@ -212,10 +265,21 @@ mode: chat · explain · edit
         <label class="label">Primary Engine</label>
         <div class="seg" id="chatProvider">
           <button class="seg-btn active" data-provider="api">remote · Ollama VPS</button>
-          <button class="seg-btn" data-provider="local">local · AirLLM (failsafe)</button>
+          <button class="seg-btn" data-provider="anthropic">claude</button>
+          <button class="seg-btn" data-provider="opencode">opencode</button>
+          <button class="seg-btn" data-provider="local">local · AirLLM</button>
         </div>
 
         <div id="chatApiGroup" class="stack">
+          <label class="label">AI service</label>
+          <select id="chatService" class="input" title="Pick a service to fill the fields">
+            <option value="">— choose —</option>
+          </select>
+          <div class="row gap6">
+            <select id="chatServiceModel" class="input grow hidden"></select>
+            <button id="btnServiceUse" class="btn hidden" title="Fill the fields with this service">Use</button>
+          </div>
+          <div id="serviceEnvNote" class="meta small"></div>
           <label class="label">VPS / Ollama Endpoint</label>
           <input id="chatApiBase" class="input" list="chatPeerList" spellcheck="false" placeholder="http://100.120.101.8:11434/v1" />
           <datalist id="chatPeerList"></datalist>
@@ -228,6 +292,29 @@ mode: chat · explain · edit
           </div>
           <label class="check"><input id="chatFailsafe" type="checkbox" checked /> auto-failsafe to local AirLLM if VPS is unreachable</label>
           <label class="check"><input id="chatClearKey" type="checkbox" /> forget the saved key</label>
+
+          <div class="row gap6">
+            <input id="ollamaPull" class="input grow" placeholder="pull a model (e.g. qwen2.5:7b)" spellcheck="false" />
+            <button id="btnOllamaPull" class="btn" title="Pull model onto the VPS">⇣ Pull</button>
+          </div>
+          <div id="ollamaList" class="results"></div>
+        </div>
+
+        <div id="chatAnthropicGroup" class="stack hidden">
+          <label class="label">Anthropic API key</label>
+          <input id="chatAnthropicKey" class="input" type="password" autocomplete="off" spellcheck="false" placeholder="sk-ant-… (saved locally)" />
+          <label class="label">Claude model</label>
+          <input id="chatAnthropicModel" class="input" list="chatAnthropicList" spellcheck="false" placeholder="claude-sonnet-4-5" />
+          <datalist id="chatAnthropicList">
+            <option value="claude-sonnet-4-5"></option>
+            <option value="claude-opus-4-1"></option>
+            <option value="claude-haiku-4-5"></option>
+          </datalist>
+          <div class="meta small">Native tool calling in agent mode · images supported · streams from the messages API.</div>
+        </div>
+
+        <div id="chatOpencodeGroup" class="stack hidden">
+          <div class="meta small">OpenCode CLI runs as the agent in this workspace — same authorizer as the IDE. Install it (<b>opencode</b> on PATH) and hit Send; output streams into the chat.</div>
         </div>
 
         <div id="chatLocalGroup" class="stack hidden">
@@ -237,6 +324,7 @@ mode: chat · explain · edit
             <datalist id="chatLocalList"></datalist>
             <button id="btnChatLoad" class="btn" title="Pre-load this checkpoint through AirLLM">Load</button>
           </div>
+          <div id="localFit" class="meta small"></div>
           <select id="chatCompression" class="input" title="Precision — auto fits the checkpoint to free VRAM">
             <option value="">auto (fit to VRAM)</option>
             <option value="8bit">8-bit (forced)</option>
@@ -261,18 +349,40 @@ mode: chat · explain · edit
           <span class="meta small">max tokens</span>
           <input id="chatMax" class="input" type="number" min="16" max="8192" step="16" value="512" style="width:82px" />
         </div>
+
+        <label class="label">API profiles (endpoints)</label>
+        <div class="row gap6">
+          <select id="chatProfileList" class="input grow" title="Active profile — profiles override the fields above"></select>
+          <button id="btnProfileSave" class="btn" title="Save current fields as a new profile">+ Save</button>
+          <button id="btnProfileDel" class="btn" title="Delete selected profile">✕</button>
+        </div>
+
+        <label class="label">Custom instructions</label>
+        <textarea id="chatInstructions" class="input" rows="2" spellcheck="false" placeholder="House style, project conventions… appended to every prompt"></textarea>
+
+        <div class="row gap6">
+          <span class="meta small">context budget</span>
+          <input id="chatBudget" class="input" type="number" min="2000" max="128000" step="1000" value="32000" style="width:90px" />
+        </div>
+
         <label class="check"><input id="chatContext" type="checkbox" checked /> attach active file + selection</label>
         <label class="check"><input id="chatAgentTools" type="checkbox" checked /> autonomous agent tools (read, write, edit, terminal)</label>
+        <label class="check"><input id="chatSandbox" type="checkbox" checked /> sandbox: confirm risky agent commands (format, recurse-delete, download-execute…)</label>
         <div id="chatHint" class="meta small">Local runs on this machine's GPU. Agent tools let any model read, write, edit files and run PowerShell commands autonomously.</div>
       </div>
 
       <div id="chatLog" class="chat-log"></div>
 
+      <div id="chatAttachments" class="chat-attachments hidden"></div>
       <div id="chatComposer" class="composer">
         <textarea id="chatInput" rows="3" placeholder="Ask the model… · Ctrl+Enter sends · the active selection rides along"></textarea>
         <div class="row gap6">
           <span id="chatState" class="meta small grow">idle</span>
+          <input id="chatImageInput" type="file" accept="image/*" class="hidden" />
+          <button id="btnChatAttach" class="icon-btn" title="Attach an image (api provider only)">📎</button>
+          <button id="btnChatMic" class="icon-btn" title="Dictate (needs faster-whisper)">🎙</button>
           <button id="btnChatApply" class="btn hidden" title="Replace the selection with this reply">Apply</button>
+          <button id="btnChatStop" class="btn hidden" title="Stop the current reply">Stop</button>
           <button id="btnChatSend" class="btn primary">Send</button>
         </div>
       </div>
@@ -341,6 +451,8 @@ mode: chat · explain · edit
   };
 </script>
 <script src="/vendor/monaco.js"></script>
+<script src="/vendor/marked.js"></script>
+<script src="/vendor/purify.js"></script>
 <script src="/app.js"></script>
 </body>
 </html>

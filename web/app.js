@@ -33,15 +33,28 @@
     },
     diffTab: null,
     externalPrompt: null,
+    watch: { supported: false, cursor: 0 },
+    tasks: [],
+    preview: false,
+    attachments: [],
+    breakpoints: {},
+    remotes: null,
+    dbg: { cursor: 0, active: false, state: 'idle', frames: [], sel: null, vars: [] },
   };
+  let keyOverrides = {};
 
   const api = {
+    headers() {
+      const t = window.__vantaToken
+        || new URLSearchParams(location.search).get('token') || '';
+      return t ? { 'X-Vanta-Token': t } : {};
+    },
     async get(path, params) {
       const url = new URL(path, location.origin);
       if (params) for (const [k, v] of Object.entries(params)) {
         if (v !== undefined && v !== null) url.searchParams.set(k, v);
       }
-      const res = await fetch(url);
+      const res = await fetch(url, { headers: api.headers() });
       const data = await res.json().catch(() => ({ ok: false, error: 'bad json' }));
       if (!res.ok || data.ok === false) throw new Error(data.error || `${res.status}`);
       return data;
@@ -49,7 +62,7 @@
     async post(path, body) {
       const res = await fetch(path, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...api.headers() },
         body: JSON.stringify(body || {}),
       });
       const data = await res.json().catch(() => ({ ok: false, error: 'bad json' }));
@@ -74,7 +87,8 @@
     else window.open(url, '_blank', 'noopener');
   }
 
-  window.__vantaDirty = () => S.tabs.filter((t) => t.dirty && t.kind === 'file').length;
+  window.__vantaDirty = () => S.tabs.filter((t) => t.dirty &&
+    (t.kind === 'file' || t.kind === 'remote')).length;
   window.__vantaState = () => ({
     root: S.root,
     name: S.name,
@@ -240,6 +254,29 @@
         'tab.activeBorder': '#3ddbd0',
       },
     });
+
+    monaco.editor.defineTheme('vanta-light', {
+      base: 'vs',
+      inherit: true,
+      rules: [
+        { token: 'comment', foreground: '6b7280', fontStyle: 'italic' },
+        { token: 'string', foreground: '0a7d5a' },
+        { token: 'keyword', foreground: '7c3aed' },
+        { token: 'number', foreground: 'b45309' },
+      ],
+      colors: {
+        'editor.background': '#f7f8fa',
+        'editor.foreground': '#1f2937',
+        'editorLineNumber.foreground': '#9aa3af',
+        'editorGutter.background': '#f0f2f5',
+        'editor.selectionBackground': '#c7d9f7',
+        'editor.lineHighlightBackground': '#eef1f5',
+        'editorIndentGuide.background1': '#d5dae1',
+        'editorWidget.background': '#ffffff',
+        'editorSuggestWidget.background': '#ffffff',
+        'tab.activeBorder': '#0f9d95',
+      },
+    });
   }
 
   function setupEditor() {
@@ -278,6 +315,16 @@
     editor.onDidChangeCursorPosition((e) => {
       $('#sbCursor').textContent = `Ln ${e.position.lineNumber}, Col ${e.position.column}`;
     });
+    editor.onMouseDown((e) => {
+      const t = e.target.type;
+      if (t === monaco.MouseTargetType.GUTTER_GUTTER
+          || t === monaco.MouseTargetType.GUTTER_LINE_NUMBERS) {
+        const tab = activeTab();
+        if (tab && tab.kind === 'file' && e.target.position) {
+          toggleBreakpoint(tab.path, e.target.position.lineNumber);
+        }
+      }
+    });
     editor.onDidChangeModelLanguage?.(() => {});
 
     editor.addAction({
@@ -288,6 +335,8 @@
     $('#editor').addEventListener('mouseleave', () => {});
 
     defineTheme();
+    registerLspProviders();
+    applyTheme();
     editor.updateOptions({ theme: 'vanta' });
   }
 
@@ -300,7 +349,21 @@
     return model;
   }
 
-  /* ---------------------------------- tabs --------------------------------- */
+  /* --------------------------------- tabs --------------------------------- */
+  function scheduleSessionSave() {
+    clearTimeout(scheduleSessionSave.timer);
+    scheduleSessionSave.timer = setTimeout(async () => {
+      if (!S.root) return;
+      try {
+        await api.post('/api/session/save', {
+          root: S.root,
+          tabs: S.tabs.filter((t) => t.kind === 'file').map((t) => ({ path: t.path })),
+          active: S.active,
+        });
+      } catch { /* best effort */ }
+    }, 800);
+  }
+
   function renderTabs() {
     const host = $('#tabs');
     host.innerHTML = '';
@@ -394,6 +457,11 @@
     renderTabs();
     renderCrumbs();
     renderTree();
+    scheduleSessionSave();
+    if (tab.kind === 'file') {
+      lspSend('open', tab).then(() => lspDiagnostics(tab));
+    }
+    updatePreview();
   }
 
   async function openFile(rel, line = null) {
@@ -427,10 +495,16 @@
           clearTimeout(tab._auto);
           tab._auto = setTimeout(() => saveTab(tab), 900);
         }
+        clearTimeout(tab._lsp);
+        tab._lsp = setTimeout(() => {
+          lspSend('change', tab, { version: Date.now() }).then(() => lspDiagnostics(tab));
+          updatePreview();
+        }, 500);
       });
       S.tabs.push(tab);
       activateTab(tab.key);
       if (line) gotoLine(tab, line);
+      lspSend('open', tab).then(() => lspDiagnostics(tab));
     } catch (err) {
       toast(`open failed: ${err.message}`, 'err');
     }
@@ -447,8 +521,23 @@
   }
 
   async function saveTab(tab) {
-    if (!tab || tab.kind !== 'file' || !tab.model) return;
-    try {
+    if (!tab) return;
+    if (tab.kind === 'remote') {
+      try {
+        await api.post('/api/remotes/write',
+          { id: tab.remote.id, root: S.root || '', path: tab.remote.path,
+            content: tab.model.getValue() });
+        tab.savedContent = tab.model.getValue();
+        tab.dirty = false;
+        tab.mtime = 0;
+        renderTabs();
+        toast(`${tab.name} saved to remote`, 'ok');
+      } catch (err) {
+        toast(err.message, 'err');
+      }
+      return;
+    }
+    if (tab.kind !== 'file' || !tab.model) return;    try {
       const content = tab.model.getValue();
       const res = await api.post('/api/file', { root: S.root, path: tab.path, content });
       tab.dirty = false;
@@ -500,7 +589,32 @@
   }
 
   /* ---------------------------------- tree --------------------------------- */
+  function trustedList() {
+    try { return JSON.parse(localStorage.getItem('vanta.trusted') || '[]'); }
+    catch { return []; }
+  }
+
+  function trustRemember(path) {
+    const list = trustedList();
+    if (!list.some((r) => r.toLowerCase() === String(path).toLowerCase())) {
+      list.push(path);
+      try { localStorage.setItem('vanta.trusted', JSON.stringify(list.slice(-50))); } catch { /* */ }
+    }
+  }
+
   async function openProject(path) {
+    const known = (S.env.recent || []).some((r) =>
+      r && r.toLowerCase() === String(path).toLowerCase())
+      || trustedList().some((r) => r.toLowerCase() === String(path).toLowerCase());
+    if (!known) {
+      const ok = await confirmModal(
+        'Open folder',
+        `First time opening this folder. Vanta reads and writes real files here, `
+        + `and the agent can run shell commands with your privileges. Trust it?`,
+        'Trust & Open', true);
+      if (!ok) return null;
+      trustRemember(path);
+    }
     try {
       const res = await api.post('/api/project/open', { path });
       S.root = res.root;
@@ -531,6 +645,11 @@
       $('#sbProject').textContent = S.name;
       document.title = `${S.name} — Vanta`;
       ncall('set_title', `Vanta IDE — ${S.name}`);
+      S.watch = { supported: false, cursor: 0 };
+      api.post('/api/watch/start', { root: S.root }).then((r) => {
+        S.watch.supported = !!r.supported;
+        S.watch.cursor = 0;
+      }).catch(() => {});
       await refreshTree();
       refreshGit();
       renderRecent();
@@ -576,7 +695,8 @@
   async function renderDirNode(rel, host, depth, token = 0) {
     const entries = await listDir(rel);
     if (token && token !== renderTree.token) return;
-    for (const entry of entries) {
+    const CHUNK = 400;
+    const makeRow = (entry) => {
       const row = document.createElement('div');
       const isOpen = S.expanded.has(entry.path);
       row.className = 'node' + (entry.isDir ? ' dir' : '') + (S.selected === entry.path ? ' selected' : '');
@@ -614,11 +734,35 @@
         const childHost = document.createElement('div');
         childHost.className = 'children open';
         host.appendChild(childHost);
-        try {
-          await renderDirNode(entry.path, childHost, depth + 1, token);
-        } catch (err) {
-          childHost.innerHTML = `<div class="side-empty">${esc(err.message)}</div>`;
-        }
+        renderDirNode(entry.path, childHost, depth + 1, token)
+          .catch((err) => {
+            childHost.innerHTML = `<div class="side-empty">${esc(err.message)}</div>`;
+          });
+      }
+    };
+
+    // windowed rendering: huge directories stream in chunks of 400 rows
+    for (let i = 0; i < entries.length; i += CHUNK) {
+      if (token && token !== renderTree.token) return;
+      entries.slice(i, i + CHUNK).forEach(makeRow);
+      if (i + CHUNK < entries.length) {
+        const more = document.createElement('div');
+        more.className = 'node more';
+        more.style.paddingLeft = `${8 + depth * 12}px`;
+        const shown = Math.min(i + CHUNK, entries.length);
+        more.innerHTML = `<span class="nm meta">▾ ${esc(String(entries.length - shown))} more…</span>`;
+        more.addEventListener('click', (e) => {
+          e.stopPropagation();
+          const next = entries.slice(i + CHUNK, i + 2 * CHUNK);
+          next.forEach(makeRow);
+          if (i + 2 * CHUNK < entries.length) {
+            more.remove();
+            host.appendChild(more);
+            more.querySelector('.nm').textContent = `▾ ${entries.length - i - 2 * CHUNK} more…`;
+          } else more.remove();
+        });
+        host.appendChild(more);
+        return;          // lazy: render the next chunk on demand
       }
     }
   }
@@ -784,6 +928,53 @@
     }
   }
 
+  async function replaceAll() {
+    const q = $('#searchInput').value.trim();
+    const replacement = $('#searchReplace').value;
+    if (!S.root) return toast('open a folder first', 'err');
+    if (!q) return toast('search first', 'err');
+    if (q === replacement) return toast('search and replace are identical', 'err');
+    const opts = searchOptions();
+    const include = $('#searchInclude').value.trim();
+    $('#searchMeta').textContent = 'scanning…';
+    try {
+      const preview = await api.post('/api/search/replace', {
+        root: S.root, q, regex: opts.regex === '1', case: opts.case === '1',
+        include, replacement, preview: true,
+      });
+      $('#searchMeta').textContent = `${preview.total} file${preview.total === 1 ? '' : 's'} to change`;
+      if (!preview.total) { toast('nothing to replace', 'ok'); return; }
+      const shown = preview.files.slice(0, 6).map((f) => `• ${f}`).join('<br/>');
+      const more = preview.files.length > 6
+        ? `<br/>… and ${preview.total - 6} more` : '';
+      const ok = await openModal({
+        title: 'Replace All',
+        body: `<div>Replace <b>${esc(q)}</b> with <b>${esc(replacement)}</b> in `
+          + `<b>${preview.total}</b> file${preview.total === 1 ? '' : 's'}?<br/><br/>`
+          + `<div class="meta small">${shown}${more}</div></div>`,
+        ok: 'Replace', danger: true,
+      });
+      if (!ok) return;
+      const res = await api.post('/api/search/replace', {
+        root: S.root, q, regex: opts.regex === '1', case: opts.case === '1',
+        include, replacement,
+      });
+      const n = res.changed.length;
+      $('#searchMeta').textContent = `replaced in ${n} file${n === 1 ? '' : 's'}`;
+      toast(`replaced in ${n} file${n === 1 ? '' : 's'}`, 'ok');
+      if (res.failed.length) {
+        toast(`${res.failed.length} file(s) failed`, 'err');
+      }
+      S.treeCache.clear();
+      renderTree();
+      refreshGit();
+      runSearch();
+    } catch (err) {
+      $('#searchMeta').textContent = err.message;
+      toast(err.message, 'err');
+    }
+  }
+
   /* ---------------------------------- git ---------------------------------- */
   async function refreshGit() {
     if (!S.root) return;
@@ -813,8 +1004,10 @@
         list.appendChild(row);
       }
       if (changed) renderTree();
+      loadBranches();
     } catch (err) {
       $('#gitBranchRow').textContent = err.message;
+      $('#gitActions')?.classList.add('hidden');
     }
   }
 
@@ -882,6 +1075,61 @@
       toast(err.message, 'err');
     } finally {
       $('#btnCommit').disabled = false;
+    }
+  }
+
+  async function loadBranches() {
+    if (!S.root) return;
+    try {
+      const res = await api.get('/api/git/branches', { root: S.root });
+      const sel = $('#gitBranch');
+      if (!res.branches || !res.branches.length) {
+        sel.innerHTML = '';
+        $('#gitActions').classList.add('hidden');
+        return;
+      }
+      $('#gitActions').classList.remove('hidden');
+      if (sel.dataset.sig !== res.branches.join(',')) {
+        sel.dataset.sig = res.branches.join(',');
+        sel.innerHTML = res.branches.map((b) =>
+          `<option value="${esc(b)}">${esc(b)}</option>`).join('');
+      }
+      if (res.current) sel.value = res.current;
+    } catch {
+      $('#gitActions').classList.add('hidden');
+    }
+  }
+
+  async function checkoutBranch(branch) {
+    if (!branch || branch === S.git.branch) return;
+    try {
+      const res = await api.post('/api/git/checkout', { root: S.root, branch });
+      toast(`switched to ${branch}`, 'ok');
+      S.treeCache.clear();
+      await refreshTree();
+      refreshGit();
+      if (res.output) $('#gitCommitOut').textContent = res.output.split('\n')[0];
+    } catch (err) {
+      toast(err.message, 'err');
+      loadBranches();
+    }
+  }
+
+  async function gitPushPull(kind) {    if (!S.root) return;
+    const btn = kind === 'push' ? $('#btnGitPush') : $('#btnGitPull');
+    btn.disabled = true;
+    try {
+      const res = await api.post(`/api/git/${kind}`, { root: S.root });
+      toast(`${kind} ok`, 'ok');
+      if (res.output) $('#gitCommitOut').textContent = res.output.trim().split('\n')[0];
+      refreshGit();
+      S.treeCache.clear();
+      renderTree();
+    } catch (err) {
+      toast(`${kind}: ${err.message}`, 'err');
+      $('#gitCommitOut').textContent = err.message;
+    } finally {
+      btn.disabled = false;
     }
   }
 
@@ -1028,26 +1276,36 @@
 
   function paintChatTag() {
     const tag = $('#chatTag');
-    const provider = S.ai.provider === 'api' ? 'api' : 'local';
-    const label = provider === 'api' ? 'vps' : 'local';
-    const model = provider === 'api'
-      ? (($('#chatApiModel') && $('#chatApiModel').value) || S.ai.model || 'auto')
-      : (S.ai.model || ($('#chatLocalModel') ? $('#chatLocalModel').value.trim() : ''));
+    const provider = S.ai.provider;
+    const labels = { api: 'vps', anthropic: 'claude', opencode: 'opencode', local: 'local' };
+    const label = labels[provider] || provider;
+    const model = provider === 'local'
+      ? (S.ai.model || ($('#chatLocalModel') ? $('#chatLocalModel').value.trim() : ''))
+      : provider === 'anthropic'
+        ? (($('#chatAnthropicModel') && $('#chatAnthropicModel').value.trim()) || S.ai.model || 'claude')
+        : provider === 'opencode' ? 'opencode'
+          : (($('#chatApiModel') && $('#chatApiModel').value) || S.ai.model || 'auto');
     const fsOn = $('#chatFailsafe') ? $('#chatFailsafe').checked : S.ai.failsafe !== false;
     if (tag) {
       tag.textContent = `${label} · ${model || 'auto'}`;
       tag.classList.toggle('api', provider === 'api');
       tag.title = provider === 'api'
         ? `Primary: Remote Ollama VPS${fsOn ? ' (Local AirLLM failsafe armed)' : ''}`
-        : 'Local AirLLM engine';
+        : provider === 'anthropic' ? 'Claude (Anthropic API)'
+          : provider === 'opencode' ? 'OpenCode CLI agent'
+            : 'Local AirLLM engine';
     }
     const chip = $('#sbAi');
     if (chip) {
       chip.textContent = `ai: ${label}${model ? ' · ' + base(model) : ''}${provider === 'api' && fsOn ? ' (+fs)' : ''}`;
       chip.classList.toggle('busy', S.ai.state === 'generating' || S.ai.state === 'loading');
-      chip.title = provider === 'api'
-        ? `Remote Ollama VPS (${$('#chatApiBase')?.value || ''}) — Failsafe: ${fsOn ? 'Local AirLLM' : 'off'}`
-        : `Local AirLLM (${model || ''})`;
+      const titles = {
+        api: `Remote Ollama VPS (${$('#chatApiBase')?.value || ''}) — Failsafe: ${fsOn ? 'Local AirLLM' : 'off'}`,
+        anthropic: 'Claude via Anthropic API',
+        opencode: 'OpenCode CLI agent in this workspace',
+        local: `Local AirLLM (${model || ''})`,
+      };
+      chip.title = titles[provider] || provider;
     }
   }
 
@@ -1065,20 +1323,35 @@
   function applyChatConfig(cfg) {
     if (!cfg) return;
     chatCfg = cfg;
-    S.ai.provider = cfg.provider === 'local' ? 'local' : 'api';
+    S.ai.provider = ['api', 'anthropic', 'opencode', 'local'].includes(cfg.provider)
+      ? cfg.provider : 'api';
     S.ai.failsafe = cfg.failsafe !== false;
     S.ai.mode = cfg.mode || 'agent';
     $$('#chatProvider .seg-btn').forEach((b) =>
       b.classList.toggle('active', b.dataset.provider === S.ai.provider));
     $('#chatLocalGroup').classList.toggle('hidden', S.ai.provider !== 'local');
     $('#chatApiGroup').classList.toggle('hidden', S.ai.provider !== 'api');
+    $('#chatAnthropicGroup').classList.toggle('hidden', S.ai.provider !== 'anthropic');
+    $('#chatOpencodeGroup').classList.toggle('hidden', S.ai.provider !== 'opencode');
 
     $('#chatMode').value = S.ai.mode;
     if (cfg.temperature !== undefined) $('#chatTemp').value = cfg.temperature;
     if (cfg.maxTokens !== undefined) $('#chatMax').value = cfg.maxTokens;
     $('#chatContext').checked = cfg.contextFile !== false;
     if ($('#chatAgentTools')) $('#chatAgentTools').checked = cfg.agentTools !== false;
+    if ($('#chatSandbox')) $('#chatSandbox').checked = cfg.agentSandbox !== false;
     if ($('#chatFailsafe')) $('#chatFailsafe').checked = S.ai.failsafe;
+    if ($('#chatInstructions')) $('#chatInstructions').value = cfg.customInstructions || '';
+    if ($('#chatBudget')) $('#chatBudget').value = cfg.contextBudget || 32000;
+
+    // API profiles
+    const profList = $('#chatProfileList');
+    if (profList) {
+      const profs = cfg.apiProfiles || [];
+      profList.innerHTML = '<option value="">default (fields above)</option>' +
+        profs.map((p) => `<option value="${esc(p.name)}">${esc(p.name)}${p.hasKey ? ' ·key' : ''}</option>`).join('');
+      profList.value = cfg.profile || '';
+    }
 
     const local = cfg.local || {};
     $('#chatLocalModel').value = local.model || '';
@@ -1103,6 +1376,12 @@
     $('#chatApiKey').placeholder = apiCfg.hasKey
       ? 'key saved — type to replace'
       : 'optional — saved to ide/.ai.json';
+    if ($('#chatAnthropicKey')) {
+      $('#chatAnthropicKey').value = '';
+      $('#chatAnthropicKey').placeholder = (cfg.anthropic && cfg.anthropic.hasKey)
+        ? 'key saved — type to replace'
+        : 'sk-ant-… (saved locally)';
+    }
     if (apiCfg.model) {
       const sel = $('#chatApiModel');
       if (!Array.from(sel.options).some((o) => o.value === apiCfg.model)) {
@@ -1135,13 +1414,50 @@
     }
   }
 
+  async function saveProfile() {
+    const name = await promptModal('New profile name', '', 'e.g. groq · openai · vps-2');
+    if (!name) return;
+    const profs = ((chatCfg || {}).apiProfiles || []).filter((p) => p.name !== name);
+    profs.push({
+      name,
+      baseUrl: $('#chatApiBase').value.trim(),
+      model: $('#chatApiModel').value || '',
+    });
+    const key = $('#chatApiKey').value.trim();
+    if (key) profs[profs.length - 1].apiKey = key;
+    const res = await saveChatConfig({ apiProfiles: profs, profile: name });
+    if (res) {
+      await loadChatConfig();
+      toast(`profile ${name} saved`, 'ok');
+    }
+  }
+
+  async function deleteProfile() {
+    const sel = $('#chatProfileList');
+    const name = sel.value;
+    if (!name) return toast('select a profile first', 'err');
+    const ok = await confirmModal('Delete profile', `Remove profile "${name}"?`, 'Delete', true);
+    if (!ok) return;
+    const profs = ((chatCfg || {}).apiProfiles || []).filter((p) => p.name !== name);
+    await saveChatConfig({ apiProfiles: profs, profile: '' });
+    await loadChatConfig();
+    toast(`profile ${name} deleted`, 'ok');
+  }
+
   function gatherChatPatch(extra) {
     const patch = {
       provider: S.ai.provider,
+      profile: $('#chatProfileList') ? ($('#chatProfileList').value || '') : '',
+      customInstructions: $('#chatInstructions') ? $('#chatInstructions').value : '',
+      contextBudget: Number($('#chatBudget') ? $('#chatBudget').value : 0) || 32000,
+      anthropic: {
+        model: $('#chatAnthropicModel') ? $('#chatAnthropicModel').value.trim() : '',
+      },
       failsafe: $('#chatFailsafe') ? $('#chatFailsafe').checked : true,
       mode: $('#chatMode').value,
       contextFile: $('#chatContext').checked,
       agentTools: $('#chatAgentTools') ? $('#chatAgentTools').checked : true,
+      agentSandbox: $('#chatSandbox') ? $('#chatSandbox').checked : true,
       temperature: Number($('#chatTemp').value) || 0.6,
       maxTokens: Number($('#chatMax').value) || 512,
       local: {
@@ -1155,6 +1471,8 @@
     };
     const key = $('#chatApiKey').value.trim();
     if (key) patch.api.apiKey = key;
+    const akey = $('#chatAnthropicKey') ? $('#chatAnthropicKey').value.trim() : '';
+    if (akey) patch.anthropic.apiKey = akey;
     return Object.assign(patch, extra || {});
   }
 
@@ -1176,14 +1494,21 @@
   }
 
   function setProvider(provider, quiet = false) {
-    S.ai.provider = provider === 'local' ? 'local' : 'api';
+    const known = ['api', 'anthropic', 'opencode', 'local'];
+    S.ai.provider = known.includes(provider) ? provider : 'api';
     $$('#chatProvider .seg-btn').forEach((b) =>
       b.classList.toggle('active', b.dataset.provider === S.ai.provider));
     $('#chatLocalGroup').classList.toggle('hidden', S.ai.provider !== 'local');
     $('#chatApiGroup').classList.toggle('hidden', S.ai.provider !== 'api');
-    $('#chatHint').textContent = S.ai.provider === 'api'
-      ? 'Primary: Remote Ollama on VPS. If unreachable and failsafe is checked, requests automatically route to local AirLLM.'
-      : "Failsafe / Local: AirLLM streams layers off disk onto this machine's GPU.";
+    $('#chatAnthropicGroup').classList.toggle('hidden', S.ai.provider !== 'anthropic');
+    $('#chatOpencodeGroup').classList.toggle('hidden', S.ai.provider !== 'opencode');
+    const hints = {
+      api: 'Primary: Remote Ollama on VPS. If unreachable and failsafe is checked, requests automatically route to local AirLLM.',
+      anthropic: 'Claude via api.anthropic.com — native tool calling in agent mode. Set your key below.',
+      opencode: 'OpenCode CLI runs as the agent in this workspace (`opencode run`). Install it on PATH.',
+      local: "Failsafe / Local: AirLLM streams layers off disk onto this machine's GPU.",
+    };
+    $('#chatHint').textContent = hints[S.ai.provider] || '';
     paintChatTag();
     if (!quiet) saveChatConfig({ provider: S.ai.provider });
   }
@@ -1279,6 +1604,7 @@
     stopChatClock();
     chatStream = null;
     $('#btnChatSend').disabled = false;
+    $('#btnChatStop').classList.add('hidden');
     $('#btnChatApply').classList.add('hidden');
     chatEmpty();
     if (note) aiWrite('system', note, 'system');
@@ -1293,15 +1619,21 @@
     S.ai.busy = false;
     stopChatClock();
     $('#btnChatSend').disabled = false;
+    $('#btnChatStop').classList.add('hidden');
     if (chatStream) chatStream.classList.remove('streaming');
     chatStream = null;
+  }
+
+  async function stopChat() {
+    if (!S.ai.busy) return;
+    try { await api.post('/api/ai/cancel'); } catch { /* best effort */ }
   }
 
   function finishChatReply(text) {
     const div = (chatStream && chatStream.isConnected)
       ? chatStream : aiWrite('assistant', '', 'assistant');
     div.classList.remove('streaming');
-    div.querySelector('.who').textContent = S.ai.provider === 'api' ? 'api' : 'local';
+    div.querySelector('.who').textContent = S.ai.provider;
     const body = div.querySelector('.msg-body');
     const reply = text !== undefined && text !== null && text !== '' ? text : body.textContent;
     if (reply && body.textContent !== reply) body.textContent = reply;
@@ -1310,6 +1642,7 @@
     S.ai.busy = false;
     stopChatClock();
     $('#btnChatSend').disabled = false;
+    $('#btnChatStop').classList.add('hidden');
     if (reply) S.ai.messages.push({ role: 'assistant', content: reply });
     chatStream = null;
     if ($('#chatMode').value === 'edit') {
@@ -1326,8 +1659,11 @@
     if (!chatOpen()) showChat(true);
     const tab = activeTab();
     const fileText = tab && tab.kind === 'file' && editor ? editor.getValue() : '';
+    const images = S.ai.provider === 'api' ? S.attachments.slice(0, 4) : [];
+    if (images.length && S.ai.provider !== 'api') S.attachments = [];
     const body = {
       provider: S.ai.provider,
+      profile: $('#chatProfileList') ? ($('#chatProfileList').value || '') : '',
       failsafe: $('#chatFailsafe') ? $('#chatFailsafe').checked : true,
       mode: $('#chatMode').value,
       messages: [],
@@ -1335,24 +1671,37 @@
       maxTokens: Number($('#chatMax').value) || 512,
       contextFile: $('#chatContext').checked,
       agentTools: $('#chatAgentTools') ? $('#chatAgentTools').checked : true,
+      agentSandbox: $('#chatSandbox') ? $('#chatSandbox').checked : true,
       localModel: $('#chatLocalModel').value.trim(),
       apiBaseUrl: $('#chatApiBase').value.trim(),
       apiModel: $('#chatApiModel').value,
+      anthropicModel: $('#chatAnthropicModel') ? $('#chatAnthropicModel').value.trim() : '',
+      anthropicApiKey: $('#chatAnthropicKey') ? $('#chatAnthropicKey').value.trim() : '',
       root: S.root || '',
       file: tab ? tab.path : '',
       fileText,
       selection: selectionText(),
     };
+    if (body.provider !== 'api' && body.provider !== 'anthropic') delete body.anthropicApiKey;
     input.value = '';
-    S.ai.messages.push({ role: 'user', content: text });
+    if (images.length) {
+      const content = [{ type: 'text', text }];
+      for (const url of images) content.push({ type: 'image_url', image_url: { url } });
+      S.ai.messages.push({ role: 'user', content });
+      S.attachments = [];
+      renderAttachments();
+    } else {
+      S.ai.messages.push({ role: 'user', content: text });
+    }
     body.messages = S.ai.messages.slice(-16);
     aiWrite('you', text, 'user');
     S.ai.busy = true;
     S.ai.lastReply = '';
     $('#btnChatSend').disabled = true;
+    $('#btnChatStop').classList.remove('hidden');
     $('#btnChatApply').classList.add('hidden');
     startChatClock();
-    const pending = aiWrite(S.ai.provider === 'api' ? 'vps' : 'local', '', 'assistant streaming', true);
+    const pending = aiWrite(S.ai.provider === 'api' ? 'vps' : S.ai.provider, '', 'assistant streaming', true);
     try {
       const res = await api.post('/api/ai/chat', body);
       if (res.model) S.ai.model = res.model;
@@ -1365,6 +1714,7 @@
         maxTokens: body.maxTokens,
         contextFile: body.contextFile,
         agentTools: body.agentTools,
+        agentSandbox: body.agentSandbox,
       });
     } catch (err) {
       if (pending.isConnected) pending.remove();
@@ -1404,8 +1754,7 @@
           setAiState(res.state, ev.msg);
         } else if (ev.type === 'delta') {
           if (!chatStream || !chatStream.isConnected) {
-            chatStream = aiWrite(S.ai.provider === 'api' ? 'api' : 'local',
-              '', 'assistant streaming', true);
+            chatStream = aiWrite(S.ai.provider, '', 'assistant streaming', true);
           }
           const body = chatStream.querySelector('.msg-body');
           body.textContent += ev.text;
@@ -1417,7 +1766,7 @@
             const body = chatStream.querySelector('.msg-body');
             if (!body.textContent && ev.text) body.textContent = ev.text;
           } else if (ev.text) {
-            aiWrite(S.ai.provider === 'api' ? 'api' : 'local', ev.text, 'assistant');
+            aiWrite(S.ai.provider, ev.text, 'assistant');
           }
           chatStream = null;
         } else if (ev.type === 'tool') {
@@ -1449,12 +1798,33 @@
           aiWrite('engine', ev.msg, 'system');
         } else if (ev.type === 'log') {
           /* engine diagnostics stay out of the conversation */
+        } else if (ev.type === 'confirm') {
+          aiWriteConfirm(ev);
         } else if (ev.type === 'reset') {
           clearChatView();
         }
       }
       if (res.state) setAiState(res.state, res.model);
     } catch { /* server may be restarting */ }
+  }
+
+  function aiWriteConfirm(ev) {
+    const log = $('#chatLog');
+    const div = document.createElement('div');
+    div.className = 'msg confirm';
+    div.innerHTML = `
+      <div class="tool-head"><span class="tool-badge">⚠ confirm</span></div>
+      <div class="msg-body"><pre class="modal-pre">${esc(ev.command || '')}</pre>
+        <div class="row gap6">
+          <button class="btn danger" data-cid="${esc(ev.id)}" data-approve="0">Deny</button>
+          <button class="btn primary" data-cid="${esc(ev.id)}" data-approve="1">Allow</button>
+        </div></div>`;
+    log.appendChild(div);
+    log.scrollTop = log.scrollHeight;
+  }
+
+  async function answerConfirm(id, approve) {
+    try { await api.post('/api/confirm', { id, approve }); } catch { /* gone */ }
   }
 
   /* --------------------------------- panel --------------------------------- */
@@ -1468,6 +1838,7 @@
     $$('.ptab').forEach((b) => b.classList.toggle('active', b.dataset.ptab === name));
     $('#termPane').classList.toggle('hidden', name !== 'terminal');
     $('#outputPane').classList.toggle('hidden', name !== 'output');
+    $('#debugPane').classList.toggle('hidden', name !== 'debug');
     if (name === 'terminal') $('#termInput').focus();
   }
 
@@ -1491,6 +1862,7 @@
     $('#sidebar').classList.remove('collapsed');
     if (name === 'search') $('#searchInput').focus();
     if (name === 'scm') refreshGit();
+    if (name === 'project') { loadRemotes(); loadPlugins(); loadEditors(); }
     paintChatAct();
   }
 
@@ -1552,6 +1924,7 @@
     ],
     run: [
       ['Run Active File', 'F5', () => S.active && runFile(activeTab()?.path)],
+      ['Debug Python File', '', debugActiveFile],
       ['Restart Terminal', '', () => startTerminal(S.root || undefined)],
       ['Stop Shell', '', () => S.term.id && api.post('/api/term/interrupt', { id: S.term.id }).catch(() => {})],
       ['divider'],
@@ -1656,8 +2029,13 @@
         label: base(p), path: p, kind: 'file', run: () => openFile(p),
       }));
     }
-    return COMMANDS.map((c) => ({
-      label: c.label, path: c.hint || '', kind: 'cmd', run: c.run,
+    return COMMANDS.concat(S.tasks.map((t) => ({
+      label: `Task: ${t.label || t.name || 'task'}`,
+      hint: (t.command || t.cmd || t.run || '').slice(0, 60),
+      kind: 'task',
+      run: () => runTask(t),
+    }))).map((c) => ({
+      label: c.label, path: c.hint || '', kind: c.kind || 'cmd', run: c.run,
     }));
   }
 
@@ -1716,6 +2094,7 @@
   }
 
   function openPalette() {
+    loadTasks();
     openOverlay('commands', 'Type a command…');
   }
 
@@ -1738,6 +2117,7 @@
     { label: 'Terminal: Clear', run: () => { $('#termOut').textContent = ''; } },
     { label: 'Terminal: Interrupt', run: () => S.term.id && api.post('/api/term/interrupt', { id: S.term.id }).catch(() => {}) },
     { label: 'Run: Active File', hint: 'F5', run: () => S.active && runFile(activeTab()?.path) },
+    { label: 'Debug: Python File', run: debugActiveFile },
     { label: 'Git: Refresh Status', run: refreshGit },
     { label: 'Git: Commit Staged…', run: () => { setView('scm'); $('#gitMessage').focus(); } },
     { label: 'Chat: Toggle Settings', run: () => $('#chatSettings').classList.toggle('hidden') },
@@ -1748,6 +2128,10 @@
     { label: 'Editor: Find', hint: 'Ctrl+F', run: () => editor.trigger('p', 'actions.find') },
     { label: 'Editor: Go to Line', hint: 'Ctrl+G', run: () => editor.trigger('p', 'editor.action.gotoLine') },
     { label: 'Editor: Format Document', hint: 'Shift+Alt+F', run: () => editor.trigger('p', 'editor.action.formatDocument') },
+    { label: 'Editor: Markdown Preview', run: toggleMdPreview },
+    { label: 'Tools: Database Query…', run: dbModal },
+    { label: 'Tools: HTTP Request…', run: httpModal },
+    { label: 'View: Toggle Light Theme', run: toggleTheme },
     { label: 'Help: Keyboard Shortcuts', run: showShortcuts },
     { label: 'Reload Window', run: () => location.reload() },
   ];
@@ -1823,7 +2207,8 @@
 
     const load = async (p) => {
       try {
-        const data = await fetch('/api/browse?path=' + encodeURIComponent(p)).then((r) => r.json());
+        const data = await fetch('/api/browse?path=' + encodeURIComponent(p),
+          { headers: api.headers() }).then((r) => r.json());
         if (data.ok === false) { $('#browseHint').textContent = data.error; return; }
         current = data.path;
         $('#browsePath').value = data.path;
@@ -1882,6 +2267,1005 @@
     }).then(() => {});
   }
 
+  /* ------------------------------ LSP bridge ------------------------------- */
+  const LSP_LANGS = ['python', 'typescript', 'javascript', 'go', 'rust',
+                     'json', 'css', 'html', 'yaml'];
+  const lspRegistered = new Set();
+
+  function relFromModel(model) {
+    if (!model || !S.root) return '';
+    const p = decodeURIComponent(model.uri.path).replace(/\\/g, '/');
+    const root = S.root.replace(/\\/g, '/').replace(/\/$/, '');
+    if (p.toLowerCase().startsWith(root.toLowerCase() + '/')) {
+      return p.slice(root.length + 1);
+    }
+    return p.replace(/^\//, '');
+  }
+
+  async function lspSend(kind, tab, extra = {}) {
+    if (!tab || tab.kind !== 'file' || !tab.model || !S.root) return null;
+    try {
+      return await api.post(`/api/lsp/${kind}`, {
+        root: S.root, path: tab.path, text: tab.model.getValue(), ...extra,
+      });
+    } catch { return null; }
+  }
+
+  async function lspDiagnostics(tab) {
+    if (!tab || tab.kind !== 'file' || !tab.model || !S.root) return;
+    try {
+      const res = await api.get('/api/lsp/diagnostics', { root: S.root, path: tab.path });
+      if (!res.ok) return;
+      const markers = (res.diagnostics || []).map((d) => {
+        const sev = d.severity || 1;
+        return {
+          severity: sev === 1 ? monaco.MarkerSeverity.Error
+            : sev === 2 ? monaco.MarkerSeverity.Warning
+            : sev === 3 ? monaco.MarkerSeverity.Info : monaco.MarkerSeverity.Hint,
+          message: d.message || '',
+          startLineNumber: ((d.range?.start?.line ?? 0) || 0) + 1,
+          startColumn: ((d.range?.start?.character ?? 0) || 0) + 1,
+          endLineNumber: ((d.range?.end?.line ?? 0) || 0) + 1,
+          endColumn: ((d.range?.end?.character ?? 0) || 0) + 1,
+          source: d.source || 'lsp',
+        };
+      });
+      monaco.editor.setModelMarkers(tab.model, 'lsp', markers);
+    } catch { /* no server */ }
+  }
+
+  function registerLspProviders() {
+    for (const lang of LSP_LANGS) {
+      if (lspRegistered.has(lang)) continue;
+      lspRegistered.add(lang);
+      monaco.languages.registerHoverProvider(lang, {
+        async provideHover(model, pos) {
+          const rel = relFromModel(model);
+          if (!rel || !S.root) return null;
+          try {
+            const res = await api.get('/api/lsp/hover', {
+              root: S.root, path: rel, line: pos.lineNumber, col: pos.column,
+            });
+            const c = res.result && res.result.contents;
+            if (!res.ok || !c) return null;
+            const val = typeof c === 'string' ? c
+              : (c.value || (Array.isArray(c) ? c.join('\n') : ''));
+            return val ? { contents: [{ value: val }] } : null;
+          } catch { return null; }
+        },
+      });
+      monaco.languages.registerCompletionItemProvider(lang, {
+        async provideCompletionItems(model, pos) {
+          const rel = relFromModel(model);
+          if (!rel || !S.root) return { suggestions: [] };
+          try {
+            const res = await api.get('/api/lsp/completion', {
+              root: S.root, path: rel, line: pos.lineNumber, col: pos.column,
+            });
+            const items = Array.isArray(res.result) ? res.result
+              : (res.result && res.result.items) || [];
+            const word = model.getWordUntilPosition(pos);
+            const range = new monaco.Range(pos.lineNumber, word.startColumn,
+              pos.lineNumber, word.endColumn);
+            return {
+              suggestions: items.slice(0, 400).map((i) => ({
+                label: i.label,
+                kind: monaco.languages.CompletionItemKind.Function,
+                insertText: i.insertText || i.label,
+                detail: i.detail || '',
+                range,
+              })),
+            };
+          } catch { return { suggestions: [] }; }
+        },
+      });
+      monaco.languages.registerDefinitionProvider(lang, {
+        async provideDefinition(model, pos) {
+          const rel = relFromModel(model);
+          if (!rel || !S.root) return null;
+          try {
+            const res = await api.get('/api/lsp/definition', {
+              root: S.root, path: rel, line: pos.lineNumber, col: pos.column,
+            });
+            const r = res.result;
+            if (!res.ok || !r) return null;
+            const locs = Array.isArray(r) ? r : [r];
+            return locs.filter(Boolean).map((loc) => {
+              const st = (loc.range && loc.range.start) || {};
+              return {
+                uri: monaco.Uri.parse(loc.uri || loc.targetUri),
+                range: new monaco.Range((st.line || 0) + 1, (st.character || 0) + 1,
+                  (st.line || 0) + 1, (st.character || 0) + 12),
+              };
+            });
+          } catch { return null; }
+        },
+      });
+    }
+  }
+
+  /* ---------------------------- markdown preview ---------------------------- */
+  function toggleMdPreview() {
+    const tab = activeTab();
+    if (!tab || tab.kind !== 'file' ||
+        !/\.(md|markdown|mdx)$/i.test(tab.path || '')) {
+      return toast('open a markdown file first', 'err');
+    }
+    S.preview = !S.preview;
+    updatePreview();
+  }
+
+  function updatePreview() {
+    const host = $('#mdPreview');
+    if (!host) return;
+    const tab = activeTab();
+    const show = S.preview && tab && tab.kind === 'file' &&
+      tab.model && /\.(md|markdown|mdx)$/i.test(tab.path || '');
+    host.classList.toggle('hidden', !show);
+    $('#editor').classList.toggle('hidden', !!show);
+    if (show && self.vantaMd) {
+      host.innerHTML = self.vantaMd.render(tab.model.getValue());
+    }
+  }
+
+  /* ------------------------------- db client -------------------------------- */
+  function dbModal() {
+    if (!S.root) return toast('open a folder first', 'err');
+    const body = `
+      <div class="row gap6">
+        <input class="input grow" id="dbPath" placeholder="database file (e.g. data/app.db)" spellcheck="false" />
+        <button class="btn" id="dbRun">Run</button>
+      </div>
+      <textarea class="input" id="dbSql" rows="4" spellcheck="false" placeholder="SELECT name FROM sqlite_master WHERE type='table'"></textarea>
+      <div id="dbOut" class="modal-out"></div>`;
+    openModal({ title: 'Database (SQLite, read-only)', body, ok: 'Close', cancel: 'Close' });
+    setTimeout(() => {
+      $('#dbRun').addEventListener('click', async () => {
+        const out = $('#dbOut');
+        out.textContent = 'running…';
+        try {
+          const res = await api.post('/api/db/query', {
+            root: S.root, path: $('#dbPath').value.trim(),
+            sql: $('#dbSql').value.trim(),
+          });
+          if (!res.rows.length) { out.textContent = '(no rows)'; return; }
+          const head = `<tr>${res.columns.map((c) => `<th>${esc(c)}</th>`).join('')}</tr>`;
+          const rows = res.rows.map((r) =>
+            `<tr>${r.map((v) => `<td>${esc(String(v ?? ''))}</td>`).join('')}</tr>`).join('');
+          out.innerHTML = `<div class="meta small">${res.rows.length} rows`
+            + `${res.truncated ? ' (truncated)' : ''}</div>`
+            + `<div class="table-wrap"><table>${head}${rows}</table></div>`;
+        } catch (err) {
+          out.textContent = err.message;
+        }
+      });
+    }, 30);
+  }
+
+  /* ------------------------------ http client ------------------------------- */
+  function httpModal() {
+    const body = `
+      <div class="row gap6">
+        <select id="httpMethod" class="input" style="width:90px">
+          <option>GET</option><option>POST</option><option>PUT</option>
+          <option>PATCH</option><option>DELETE</option>
+        </select>
+        <input class="input grow" id="httpUrl" placeholder="https://…" spellcheck="false" />
+        <button class="btn" id="httpRun">Send</button>
+      </div>
+      <textarea class="input" id="httpBody" rows="3" spellcheck="false" placeholder="request body (json) — optional"></textarea>
+      <div id="httpOut" class="modal-out"></div>`;
+    openModal({ title: 'HTTP request', body, ok: 'Close', cancel: 'Close' });
+    setTimeout(() => {
+      $('#httpRun').addEventListener('click', async () => {
+        const out = $('#httpOut');
+        out.textContent = 'sending…';
+        const raw = $('#httpBody').value.trim();
+        try {
+          const res = await api.post('/api/http', {
+            method: $('#httpMethod').value,
+            url: $('#httpUrl').value.trim(),
+            body: raw || undefined,
+          });
+          let pretty = res.body || '';
+          try { pretty = JSON.stringify(JSON.parse(pretty), null, 2); } catch { /* raw */ }
+          out.innerHTML = `<div class="meta small">${res.status} · ${res.ms} ms</div>`
+            + `<pre class="modal-pre">${esc(pretty.slice(0, 4000))}</pre>`;
+        } catch (err) {
+          out.textContent = err.message;
+        }
+      });
+    }, 30);
+  }
+
+  /* --------------------------------- tasks ---------------------------------- */
+  async function loadTasks() {
+    try {
+      const res = await api.get('/api/tasks', { root: S.root || '' });
+      S.tasks = res.tasks || [];
+    } catch { S.tasks = []; }
+  }
+
+  function runTask(task) {
+    const cmd = task.command || task.cmd || task.run;
+    if (!cmd) return toast('task has no command', 'err');
+    sendCmdToTerm(cmd);
+    showPanel(true);
+    switchPanelTab('terminal');
+  }
+
+  /* ------------------------------- session ---------------------------------- */
+  async function restoreSession() {
+    if (!S.root) return;
+    try {
+      const res = await api.get('/api/session/load', { root: S.root });
+      const sess = res.session || {};
+      const paths = (sess.tabs || []).slice(0, 12).map((t) => t.path).filter(Boolean);
+      let last = null;
+      for (const p of paths) {
+        try { await openFile(p); last = p + '@file'; } catch { /* gone */ }
+      }
+      if (sess.active && S.tabs.some((t) => t.key === sess.active)) {
+        activateTab(sess.active);
+      } else if (last && sess.tabs.length) {
+        activateTab(last);
+      }
+      if (paths.length) toast(`restored ${paths.length} tab(s)`, 'ok');
+    } catch { /* none */ }
+  }
+
+  /* ----------------------------- ollama manager ----------------------------- */
+  async function loadOllamaModels() {
+    const list = $('#ollamaList');
+    if (!list) return;
+    try {
+      const res = await api.get('/api/ollama/tags', { base: $('#chatApiBase').value.trim() });
+      if (!res.ok) { list.innerHTML = `<div class="side-empty">${esc(res.error)}</div>`; return; }
+      list.innerHTML = (res.models || []).map((m) => `
+        <div class="change-row" data-model="${esc(m.name)}">
+          <span class="p">${esc(m.name)}</span>
+          <button class="icon-btn ollama-del" title="Delete model">✕</button>
+        </div>`).join('') || '<div class="side-empty">no models</div>';
+    } catch (err) {
+      list.innerHTML = `<div class="side-empty">${esc(err.message)}</div>`;
+    }
+  }
+
+  async function pullOllamaModel() {
+    const model = $('#ollamaPull').value.trim();
+    if (!model) return toast('model name required', 'err');
+    const btn = $('#btnOllamaPull');
+    btn.disabled = true;
+    btn.textContent = 'pulling…';
+    try {
+      const res = await api.post('/api/ollama/pull',
+        { base: $('#chatApiBase').value.trim(), model });
+      toast(`pulled ${model}`, 'ok');
+      if (res.status) $('#chatHint').textContent = `ollama: ${res.status}`;
+      loadOllamaModels();
+      fetchChatModels();
+    } catch (err) {
+      toast(`pull failed: ${err.message}`, 'err');
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '⇣ Pull';
+    }
+  }
+
+  async function deleteOllamaModel(model) {
+    const ok = await confirmModal('Delete model', `Remove ${model} from the VPS?`, 'Delete', true);
+    if (!ok) return;
+    try {
+      await api.post('/api/ollama/delete', { base: $('#chatApiBase').value.trim(), model });
+      toast(`deleted ${model}`, 'ok');
+      loadOllamaModels();
+    } catch (err) {
+      toast(err.message, 'err');
+    }
+  }
+
+  /* --------------------------------- gh prs --------------------------------- */
+  async function loadPrs() {
+    if (!S.root) return toast('open a folder first', 'err');
+    const host = $('#gitPRs');
+    host.innerHTML = '<div class="side-empty">loading…</div>';
+    try {
+      const res = await api.get('/api/gh/prs', { root: S.root });
+      if (!res.ok) { host.innerHTML = `<div class="side-empty">${esc(res.error)}</div>`; return; }
+      if (!(res.prs || []).length) { host.innerHTML = '<div class="side-empty">no open PRs</div>'; return; }
+      host.innerHTML = res.prs.map((pr) => `
+        <div class="change-row" data-pr="${pr.number}">
+          <span class="code">#${pr.number}</span>
+          <span class="p">${esc(pr.title)}${pr.isDraft ? ' (draft)' : ''}</span>
+        </div>`).join('');
+    } catch (err) {
+      host.innerHTML = `<div class="side-empty">${esc(err.message)}</div>`;
+    }
+  }
+
+  async function checkoutPr(number) {
+    try {
+      await api.post('/api/gh/pr/checkout', { root: S.root, number });
+      toast(`checked out PR #${number}`, 'ok');
+      S.treeCache.clear();
+      await refreshTree();
+      refreshGit();
+    } catch (err) {
+      toast(err.message, 'err');
+    }
+  }
+
+  /* ------------------------------- dictation -------------------------------- */
+  let mediaRec = null;
+
+  async function toggleDictation() {
+    if (mediaRec && mediaRec.state === 'recording') {
+      mediaRec.stop();
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const chunks = [];
+      mediaRec = new MediaRecorder(stream);
+      mediaRec.ondataavailable = (e) => chunks.push(e.data);
+      mediaRec.onstop = async () => {
+        stream.getTracks().forEach((t) => t.stop());
+        $('#btnChatMic').style.color = '';
+        const blob = new Blob(chunks, { type: 'audio/webm' });
+        const b64 = await new Promise((res) => {
+          const r = new FileReader();
+          r.onload = () => res(String(r.result).split(',')[1] || '');
+          r.readAsDataURL(blob);
+        });
+        $('#chatState').textContent = 'transcribing…';
+        try {
+          const out = await api.post('/api/ai/transcribe', { audio: b64 });
+          if (out.text) {
+            const inp = $('#chatInput');
+            inp.value = (inp.value ? inp.value + ' ' : '') + out.text;
+            inp.focus();
+          }
+        } catch (err) {
+          toast(err.message, 'err');
+        } finally {
+          $('#chatState').textContent = 'idle';
+        }
+      };
+      mediaRec.start();
+      $('#btnChatMic').style.color = 'var(--danger)';
+      toast('recording — click again to stop', 'ok');
+    } catch (err) {
+      toast(`mic: ${err.message}`, 'err');
+    }
+  }
+
+  /* --------------------------- image attachments ---------------------------- */
+  function renderAttachments() {
+    const host = $('#chatAttachments');
+    host.classList.toggle('hidden', !S.attachments.length);
+    host.innerHTML = S.attachments.map((a, i) =>
+      `<span class="chip"><img src="${a}" alt="img"/>`
+      + `<button data-i="${i}" title="Remove">✕</button></span>`).join('');
+  }
+
+  function addAttachmentDataUrl(dataUrl) {
+    if (S.ai.provider !== 'api') {
+      toast('images ride along on the api provider only', 'err');
+      return;
+    }
+    S.attachments.push(dataUrl);
+    renderAttachments();
+  }
+
+  function bindAttachments() {
+    $('#btnChatMic').addEventListener('click', toggleDictation);
+    $('#btnChatAttach').addEventListener('click', () => $('#chatImageInput').click());    $('#chatImageInput').addEventListener('change', () => {
+      const f = $('#chatImageInput').files[0];
+      if (!f) return;
+      const r = new FileReader();
+      r.onload = () => addAttachmentDataUrl(r.result);
+      r.readAsDataURL(f);
+      $('#chatImageInput').value = '';
+    });
+    $('#chatInput').addEventListener('paste', (e) => {
+      for (const it of (e.clipboardData && e.clipboardData.items) || []) {
+        if (it.type && it.type.startsWith('image/')) {
+          e.preventDefault();
+          const f = it.getAsFile();
+          if (!f) continue;
+          const r = new FileReader();
+          r.onload = () => addAttachmentDataUrl(r.result);
+          r.readAsDataURL(f);
+        }
+      }
+    });
+    $('#chatAttachments').addEventListener('click', (e) => {
+      const btn = e.target.closest('button[data-i]');
+      if (!btn) return;
+      S.attachments.splice(Number(btn.dataset.i), 1);
+      renderAttachments();
+    });
+  }
+
+  /* -------------------------------- debugger -------------------------------- */
+  function bpLines(path) { return S.breakpoints[path] || []; }
+
+  function toggleBreakpoint(path, line) {
+    if (!path) return;
+    const list = new Set(bpLines(path));
+    if (list.has(line)) list.delete(line); else list.add(line);
+    S.breakpoints[path] = [...list].sort((a, b) => a - b);
+    if (!S.breakpoints[path].length) delete S.breakpoints[path];
+    paintBps();
+    api.post('/api/debug/breakpoints', { root: S.root, path, lines: bpLines(path) })
+      .catch(() => {});
+  }
+
+  function paintBps() {
+    const tab = activeTab();
+    if (!tab || tab.kind !== 'file' || !tab.model) return;
+    const lines = bpLines(tab.path);
+    const old = tab._bpDecos || [];
+    tab._bpDecos = lines.length ? tab.model.deltaDecorations(old, lines.map((l) => ({
+      range: new monaco.Range(l, 1, l, 1),
+      isWholeLine: false,
+      linesDecorationsClassName: 'bp-dot',
+      className: 'bp-line',
+    }))) : tab.model.deltaDecorations(old, []);
+    const stopFrame = S.dbg.frames.find((f) => f.file && tab.path &&
+      f.file.toLowerCase().endsWith(tab.path.toLowerCase()));
+    const cur = tab._dbgDeco ? tab.model.deltaDecorations(tab._dbgDeco, []) : [];
+    tab._dbgDeco = stopFrame && S.dbg.state === 'stopped'
+      ? tab.model.deltaDecorations(cur, [{
+          range: new monaco.Range(stopFrame.line, 1, stopFrame.line, 1),
+          isWholeLine: true, className: 'dbg-line',
+        }]) : cur;
+  }
+
+  async function debugActiveFile() {
+    const tab = activeTab();
+    if (!tab || tab.kind !== 'file') return toast('open a file first', 'err');
+    if (!/\.(py|pyw)$/i.test(tab.path)) return toast('debugger runs .py files', 'err');
+    if (tab.dirty) await saveTab(tab);
+    try {
+      const res = await api.post('/api/debug/start', { root: S.root, script: tab.path });
+      S.dbg.active = true;
+      S.dbg.cursor = 0;
+      S.dbg.frames = [];
+      S.dbg.state = 'starting';
+      $('#dbgOutput').textContent = '';
+      showPanel(true);
+      switchPanelTab('debug');
+      for (const [p, lines] of Object.entries(S.breakpoints)) {
+        api.post('/api/debug/breakpoints', { root: S.root, path: p, lines }).catch(() => {});
+      }
+      paintBps();
+      toast(`debugging ${tab.name}`, 'ok');
+    } catch (err) {
+      toast(`debug: ${err.message}`, 'err');
+    }
+  }
+
+  async function pollDebug() {
+    if (!S.dbg.active) return;
+    let res;
+    try {
+      res = await api.get('/api/debug/poll', { cursor: S.dbg.cursor });
+    } catch { return; }
+    for (const ev of res.events || []) {
+      S.dbg.cursor = ev.seq;
+      if (ev.type === 'stopped') {
+        S.dbg.state = 'stopped';
+        await refreshDebug();
+      } else if (ev.type === 'continued') {
+        S.dbg.state = 'running';
+        S.dbg.frames = [];
+        S.dbg.vars = [];
+        paintBps();
+        paintDebug();
+      } else if (ev.type === 'output' && ev.category !== 'telemetry') {
+        const out = $('#dbgOutput');
+        out.textContent += ev.text;
+        out.scrollTop = out.scrollHeight;
+      } else if (ev.type === 'session' || ev.type === 'terminated' || ev.type === 'exited') {
+        S.dbg.state = ev.state || 'terminated';
+        if (S.dbg.state === 'idle' || S.dbg.state === 'terminated') {
+          S.dbg.active = S.dbg.state === 'terminated';
+          S.dbg.frames = [];
+        }
+        paintDebug();
+      } else if (ev.type === 'error') {
+        toast(ev.msg, 'err');
+      }
+    }
+    S.dbg.state = res.state || S.dbg.state;
+    paintDebug();
+  }
+
+  async function refreshDebug() {
+    try {
+      const res = await api.get('/api/debug/stack');
+      S.dbg.frames = res.frames || [];
+      const top = S.dbg.frames.find((f) => !f.file.includes('runpy')) || S.dbg.frames[0];
+      S.dbg.sel = top ? top.id : null;
+      paintBps();
+      if (top) {
+        const vars = await api.get('/api/debug/variables', { frame: top.id });
+        const locals = (vars.scopes || []).find((s) => s.name === 'Locals');
+        if (locals) {
+          const kids = await api.get('/api/debug/variables',
+            { ref: locals.variablesReference });
+          S.dbg.vars = kids.variables || [];
+        } else S.dbg.vars = [];
+      } else S.dbg.vars = [];
+    } catch { /* gone */ }
+    paintDebug();
+  }
+
+  function paintDebug() {
+    const bar = $('#dbgBar');
+    if (!bar) return;
+    bar.classList.toggle('hidden', !S.dbg.active);
+    $('#dbgState').textContent = S.dbg.active
+      ? `debug · ${S.dbg.state}${S.dbg.sel ? ' · frame ' + S.dbg.sel : ''}`
+      : '';
+    const stack = $('#dbgStack');
+    stack.innerHTML = S.dbg.frames.map((f, i) => `
+      <div class="dbg-row${f.id === S.dbg.sel ? ' sel' : ''}" data-frame="${f.id}">
+        <span class="dbg-name">${esc(f.name)}</span>
+        <span class="dbg-loc">${esc(f.file ? f.file.split(/[\\/]/).pop() : '')}:${f.line}</span>
+      </div>`).join('') || '<div class="side-empty">no frames</div>';
+    const vars = $('#dbgVars');
+    vars.innerHTML = S.dbg.vars.map((v) => `
+      <div class="dbg-row" data-ref="${v.variablesReference}">
+        <span class="dbg-name">${esc(v.name)}</span>
+        <span class="dbg-val" title="${esc(v.type || '')}">${esc(v.value)}</span>
+      </div>`).join('')
+      || '<div class="side-empty">' + (S.dbg.state === 'stopped' ? 'no locals' : 'paused? no — running') + '</div>';
+  }
+
+  async function dbgExpand(ref, rowEl) {
+    const res = await api.get('/api/debug/variables', { ref }).catch(() => null);
+    if (!res || !res.variables) return;
+    const indent = rowEl.style.paddingLeft || '10px';
+    const html = res.variables.map((v) => `
+      <div class="dbg-row" data-ref="${v.variablesReference}"
+           style="padding-left: calc(${indent} + 12px)">
+        <span class="dbg-name">${esc(v.name)}</span>
+        <span class="dbg-val">${esc(v.value)}</span>
+      </div>`).join('');
+    rowEl.insertAdjacentHTML('afterend', html);
+    rowEl.dataset.ref = '0';
+  }
+
+  async function dbgEvaluate() {
+    const expr = $('#dbgExpr').value.trim();
+    if (!expr || !S.dbg.sel) return;
+    $('#dbgExpr').value = '';
+    try {
+      const res = await api.post('/api/debug/evaluate', { expr, frame: S.dbg.sel });
+      const out = $('#dbgOutput');
+      out.textContent += `› ${expr}\n${res.result}\n`;
+      out.scrollTop = out.scrollHeight;
+    } catch (err) {
+      toast(err.message, 'err');
+    }
+  }
+
+  async function dbgCmd(cmd) {
+    try {
+      await api.post('/api/debug/cmd', { cmd });
+      if (cmd === 'stop') { S.dbg.active = false; S.dbg.state = 'idle'; }
+      else S.dbg.state = 'running';
+      paintDebug();
+    } catch (err) {
+      toast(err.message, 'err');
+    }
+  }
+
+  function bindDebugger() {
+    $('#dbgContinue').addEventListener('click', () => dbgCmd('continue'));
+    $('#dbgNext').addEventListener('click', () => dbgCmd('next'));
+    $('#dbgStepIn').addEventListener('click', () => dbgCmd('stepIn'));
+    $('#dbgStepOut').addEventListener('click', () => dbgCmd('stepOut'));
+    $('#dbgStop').addEventListener('click', () => dbgCmd('stop'));
+    $('#dbgExpr').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); dbgEvaluate(); }
+    });
+    $('#dbgStack').addEventListener('click', async (e) => {
+      const row = e.target.closest('[data-frame]');
+      if (!row) return;
+      S.dbg.sel = Number(row.dataset.frame);
+      const vars = await api.get('/api/debug/variables', { frame: S.dbg.sel }).catch(() => null);
+      const locals = vars && (vars.scopes || []).find((s) => s.name === 'Locals');
+      S.dbg.vars = [];
+      if (locals) {
+        const kids = await api.get('/api/debug/variables', { ref: locals.variablesReference });
+        S.dbg.vars = kids.variables || [];
+      }
+      paintDebug();
+    });
+    $('#dbgVars').addEventListener('click', (e) => {
+      const row = e.target.closest('[data-ref]');
+      if (!row) return;
+      const ref = Number(row.dataset.ref);
+      if (ref > 0) dbgExpand(ref, row);
+    });
+  }
+
+  /* ------------------------------- remotes ---------------------------------- */
+  async function loadRemotes() {
+    const host = $('#remoteList');
+    if (!host) return;
+    try {
+      const res = await api.get('/api/remotes/list', { root: S.root || '' });
+      if (!res.ok) return;
+      S.remotes = res;
+      const rows = [];
+      for (const w of res.wsl || []) {
+        rows.push(`<div class="change-row" data-kind="wsl" data-distro="${esc(w.name)}">
+          <span class="p">WSL · ${esc(w.name)}</span></div>`);
+      }
+      for (const h of res.ssh || []) {
+        rows.push(`<div class="change-row" data-kind="ssh" data-id="${esc(h.id)}">
+          <span class="p">SSH · ${esc(h.name || h.host)}</span></div>`);
+      }
+      host.innerHTML = rows.join('') || '<div class="side-empty">none — add .vanta\\remotes.json</div>';
+    } catch { /* none */ }
+  }
+
+  function openRemoteShell(kind, distro, id) {
+    if (kind === 'wsl') sendCmdToTerm(`wsl.exe -d "${distro}"`);
+    else sendCmdToTerm(`ssh ${id}`);
+    showPanel(true);
+    switchPanelTab('terminal');
+  }
+
+  async function sshBrowseModal(id, startPath = '.') {
+    let cwd = startPath;
+    const body = `
+      <div class="row gap6">
+        <button class="btn" id="rUp" title="Parent">↑</button>
+        <input class="input grow" id="rPath" spellcheck="false" />
+        <button class="btn" id="rGo" title="Go">→</button>
+      </div>
+      <div class="browse-list" id="rList"></div>
+      <div class="meta small" id="rHint">Click a file to edit remotely.</div>`;
+    openModal({ title: `SSH · ${id}`, body, ok: 'Close', cancel: 'Close' });
+    const load = async (p) => {
+      try {
+        const res = await api.post('/api/remotes/ls', { id, root: S.root || '', path: p });
+        if (!res.ok) { $('#rHint').textContent = res.error; return; }
+        cwd = res.path;
+        $('#rPath').value = cwd;
+        const list = $('#rList');
+        list.innerHTML = '';
+        for (const e of res.entries || []) {
+          const row = document.createElement('div');
+          row.className = 'brow';
+          row.textContent = (e.isDir ? '📁 ' : '📄 ') + e.name;
+          row.addEventListener('click', async () => {
+            const np = (cwd === '/' ? '' : cwd) + '/' + e.name;
+            if (e.isDir) load(np);
+            else openRemoteFile(id, np);
+          });
+          list.appendChild(row);
+        }
+      } catch (err) {
+        $('#rHint').textContent = err.message;
+      }
+    };
+    setTimeout(() => {
+      load(cwd);
+      $('#rUp').addEventListener('click', () => {
+        load(cwd.replace(/\/[^/]+\/?$/, '') || '/');
+      });
+      $('#rGo').addEventListener('click', () => load($('#rPath').value.trim() || '.'));
+      $('#rPath').addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); load($('#rPath').value.trim()); }
+      });
+    }, 30);
+  }
+
+  async function openRemoteFile(id, path) {
+    try {
+      const res = await api.post('/api/remotes/read', { id, root: S.root || '', path });
+      if (!res.ok) return toast(res.error, 'err');
+      const name = path.split('/').pop();
+      const key = `${id}:${path}@remote`;
+      const old = S.tabs.find((t) => t.key === key);
+      if (old) { activateTab(key); return; }
+      const uri = monaco.Uri.parse(`vanta-remote:///${encodeURIComponent(id)}/${path}`);
+      const prev = monaco.editor.getModel(uri);
+      if (prev) prev.dispose();
+      const model = monaco.editor.createModel(res.content, langOf(name), uri);
+      model.updateOptions({ tabSize: 4, insertSpaces: true });
+      const tab = {
+        kind: 'remote', key, path, name: `${name} (ssh:${id})`, model,
+        remote: { id, path }, dirty: false, viewState: null,
+      };
+      tab.savedContent = res.content;
+      tab.model.onDidChangeContent(() => {
+        if (!tab.dirty) { tab.dirty = true; renderTabs(); }
+      });
+      S.tabs.push(tab);
+      activateTab(key);
+      toast(`opened remote ${name}`, 'ok');
+    } catch (err) {
+      toast(`remote open: ${err.message}`, 'err');
+    }
+  }
+
+  /* -------------------------------- plugins --------------------------------- */
+  async function loadPlugins() {
+    const host = $('#pluginList');
+    if (!host) return;
+    try {
+      const res = await api.get('/api/plugins');
+      host.innerHTML = (res.plugins || []).map((p) => `
+        <div class="change-row"><span class="p">${esc(p.name)}</span>
+        <span class="meta small">${p.ok ? '✓' : '✕ ' + esc(p.error || '')}</span></div>`).join('')
+        || '<div class="side-empty">none — plugins/ or .vanta/plugins/</div>';
+    } catch { /* none */ }
+  }
+
+  async function reloadPlugins() {
+    try {
+      await api.post('/api/plugins/reload', { root: S.root || '' });
+      toast('plugins reloaded', 'ok');
+      loadPlugins();
+    } catch (err) {
+      toast(err.message, 'err');
+    }
+  }
+
+  /* -------------------------------- updates --------------------------------- */
+  async function checkForUpdates() {
+    const body = `
+      <div id="updInfo" class="meta small">checking…</div>
+      <div id="updNotes" class="modal-out"></div>
+      <div id="updActions" class="row gap6 hidden">
+        <button class="btn primary grow" id="btnUpdStage">Download & stage</button>
+      </div>
+      <div id="updStage" class="meta small"></div>`;
+    openModal({ title: 'Software Update', body, ok: 'Close', cancel: 'Close' });
+    try {
+      const info = await api.get('/api/update/check');
+      if (!info.ok) { $('#updInfo').textContent = `check failed: ${info.error}`; return; }
+      $('#updInfo').innerHTML = info.update_available
+        ? `Version <b>${esc(info.latest)}</b> is available (you have ${esc(info.current)}).`
+        : `Up to date · v${esc(info.current)}`;
+      if (info.notes) $('#updNotes').innerHTML = `<pre class="modal-pre">${esc(String(info.notes).slice(0, 1500))}</pre>`;
+      if (info.update_available) {
+        $('#updActions').classList.remove('hidden');
+        $('#btnUpdStage').addEventListener('click', async () => {
+          $('#btnUpdStage').disabled = true;
+          $('#updStage').textContent = 'downloading…';
+          try {
+            const staged = await api.post('/api/update/stage', {});
+            if (!staged.ok) { $('#updStage').textContent = staged.error; return; }
+            $('#updStage').innerHTML = 'staged. <b>Restart & install</b> will exit Vanta, swap the files, and relaunch.';
+            $('#btnUpdStage').textContent = 'Staged ✓';
+            const applyBtn = document.createElement('button');
+            applyBtn.className = 'btn danger';
+            applyBtn.textContent = 'Restart & install';
+            $('#updActions').appendChild(applyBtn);
+            applyBtn.addEventListener('click', async () => {
+              applyBtn.disabled = true;
+              await api.post('/api/update/apply', {});
+              toast('updating — Vanta will restart', 'ok');
+            });
+          } catch (err) {
+            $('#updStage').textContent = err.message;
+          }
+        });
+      }
+    } catch (err) {
+      $('#updInfo').textContent = `check failed: ${err.message}`;
+    }
+  }
+
+  /* ------------------------------ ai services ------------------------------- */
+  let servicesCache = null;
+
+  async function loadServices() {
+    const sel = $('#chatService');
+    if (!sel || servicesCache) return;
+    try {
+      const res = await api.get('/api/ai/services');
+      servicesCache = res.services || [];
+      sel.innerHTML = '<option value="">— choose —</option>' +
+        servicesCache.map((s, i) => {
+          const envTag = s.envSet ? ' ·key ✓env' : (s.envKey ? ' ·env ' + s.envKey : '');
+          return `<option value="${i}">${esc(s.name)}${envTag}</option>`;
+        }).join('');
+    } catch { /* none */ }
+  }
+
+  function onServicePick() {
+    const sel = $('#chatService');
+    const i = Number(sel.value);
+    const note = $('#serviceEnvNote');
+    if (Number.isNaN(i) || !servicesCache[i]) {
+      $('#chatServiceModel').classList.add('hidden');
+      $('#btnServiceUse').classList.add('hidden');
+      note.textContent = '';
+      return;
+    }
+    const s = servicesCache[i];
+    note.textContent = s.envKey
+      ? (s.envSet ? `key found in ${s.envKey} — no need to paste it`
+                  : `set ${s.envKey} to skip pasting a key`)
+      : 'local server — start it, then Use';
+    const ms = $('#chatServiceModel');
+    if ((s.models || []).length) {
+      ms.classList.remove('hidden');
+      ms.innerHTML = s.models.map((m) => `<option value="${esc(m)}">${esc(m)}</option>`).join('');
+    } else ms.classList.add('hidden');
+    $('#btnServiceUse').classList.remove('hidden');
+  }
+
+  function applyService() {
+    const i = Number($('#chatService').value);
+    if (Number.isNaN(i) || !servicesCache[i]) return;
+    const s = servicesCache[i];
+    $('#chatApiBase').value = s.baseUrl;
+    if ((s.models || []).length) {
+      const m = $('#chatServiceModel').value;
+      if (!$('#chatApiModel').querySelector(`option[value="${CSS.escape(m)}"]`)) {
+        $('#chatApiModel').insertAdjacentHTML('beforeend',
+          `<option value="${esc(m)}">${esc(m)}</option>`);
+      }
+      $('#chatApiModel').value = m;
+    }
+    saveChatConfig({ api: { baseUrl: s.baseUrl, envKey: s.envKey || '' } });
+    toast(`${s.name} endpoint set${s.envSet ? ' (key from env)' : ''}`, 'ok');
+    loadOllamaModels();
+  }
+
+  /* -------------------------- local model fit labels ------------------------ */
+  async function paintLocalFit() {
+    const host = $('#localFit');
+    if (!host) return;
+    let freeGB = null;
+    try {
+      const hw = await api.get('/api/hardware');
+      const g = (hw.gpu || [])[0];
+      if (g && g.free) freeGB = parseFloat(String(g.free).replace(/[^\d.]/g, ''));
+    } catch { /* none */ }
+    if (freeGB == null) { host.textContent = ''; return; }
+    try {
+      const res = await api.get('/api/ai/models', { provider: 'local' });
+      const meta = res.meta || {};
+      const rows = [];
+      for (const [id, m] of Object.entries(meta)) {
+        const fp16 = m.paramsB * 2.0;
+        const fit = fp16 * 1.15 <= freeGB ? 'fp16'
+          : (fp16 / 3.5) * 1.15 <= freeGB ? '4-bit' : 'airllm';
+        rows.push({ id, fit, note: m.note });
+      }
+      rows.sort((a, b) => (a.fit === 'fp16' ? 0 : a.fit === '4-bit' ? 1 : 2)
+        - (b.fit === 'fp16' ? 0 : b.fit === '4-bit' ? 1 : 2));
+      const cur = $('#chatLocalModel').value.trim();
+      const hits = rows.filter((r) => r.fit !== 'airllm').slice(0, 6);
+      host.innerHTML = `<b>${freeGB.toFixed(1)} GB free VRAM</b> — good now: `
+        + hits.map((r) => `<span class="fit-chip${cur === r.id ? ' on' : ''}"
+           data-model="${esc(r.id)}" title="${esc(r.note)}">${esc(base(r.id))} · ${r.fit}</span>`).join('');
+    } catch { /* none */ }
+  }
+
+  /* ------------------------------- ide interop ------------------------------- */
+  async function loadEditors() {
+    const host = $('#editorList');
+    if (!host) return;
+    try {
+      const res = await api.get('/api/ide/editors');
+      host.innerHTML = (res.editors || []).map((e, i) => `
+        <div class="change-row" data-i="${i}">
+          <span class="p">${esc(e.name)}</span>
+          <span class="meta small">open ↗</span>
+        </div>`).join('') || '<div class="side-empty">none detected</div>';
+      host.dataset.payload = JSON.stringify(res.editors || []);
+    } catch { /* none */ }
+  }
+
+  async function openInEditor(i) {
+    const editors = JSON.parse($('#editorList').dataset.payload || '[]');
+    const e = editors[i];
+    if (!e) return;
+    const tab = activeTab();
+    try {
+      const res = await api.post('/api/ide/open', {
+        exe: e.exe, root: S.root || '',
+        path: tab && tab.kind === 'file' ? tab.path : '',
+        line: tab && tab.kind === 'file' && editor ? editor.getPosition().lineNumber : 0,
+      });
+      if (res.ok) toast(`opened in ${e.name}`, 'ok');
+      else toast(res.error, 'err');
+    } catch (err) {
+      toast(err.message, 'err');
+    }
+  }
+
+  async function importVscode() {
+    try {
+      const res = await api.get('/api/ide/import-settings');
+      const profiles = res.profiles || [];
+      if (!profiles.length) { toast('no VS Code-family settings found', 'err'); return; }
+      const p = profiles[0];
+      if (p.fontSize) {
+        S.settings.fontSize = Math.min(28, Math.max(9, p.fontSize));
+        editor.updateOptions({ fontSize: S.settings.fontSize });
+        localStorage.setItem('vanta.fontSize', String(S.settings.fontSize));
+      }
+      if (p.minimap !== null && p.minimap !== undefined) {
+        S.settings.minimap = !!p.minimap;
+        editor.updateOptions({ minimap: { enabled: S.settings.minimap } });
+        localStorage.setItem('vanta.minimap', S.settings.minimap ? '1' : '0');
+      }
+      if (p.wordWrap !== null && p.wordWrap !== undefined) {
+        S.settings.wordWrap = !!p.wordWrap;
+        editor.updateOptions({ wordWrap: S.settings.wordWrap ? 'on' : 'off' });
+        localStorage.setItem('vanta.wordWrap', S.settings.wordWrap ? '1' : '0');
+      }
+      await api.get('/api/ide/import-keybindings');
+      keyOverrides = {};
+      try {
+        const kb = await api.get('/api/config/keybindings', { root: '' });
+        keyOverrides = kb.keybindings || {};
+      } catch { /* none */ }
+      const names = profiles.map((x) => x.source).join(', ');
+      toast(`imported from ${names}: font ${p.fontSize || 'n/a'}`
+        + `${p.theme ? ' · theme "' + p.theme + '"' : ''} · keybindings`, 'ok');
+    } catch (err) {
+      toast(err.message, 'err');
+    }
+  }
+
+  let snippetProviders = false;
+  async function importSnippets() {
+    try {
+      const res = await api.get('/api/ide/snippets');
+      if (!res.total) { toast('no VS Code snippets found', 'err'); return; }
+      if (!snippetProviders) {
+        snippetProviders = true;
+        for (const [lang, items] of Object.entries(res.languages || {})) {
+          monaco.languages.registerCompletionItemProvider(lang, {
+            provideCompletionItems(model, pos) {
+              const word = model.getWordUntilPosition(pos);
+              return { suggestions: items.slice(0, 200).map((s) => ({
+                label: s.prefix,
+                kind: monaco.languages.CompletionItemKind.Snippet,
+                insertText: s.body,
+                insertTextRules:
+                  monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet,
+                detail: 'vscode snippet',
+                range: new monaco.Range(pos.lineNumber, word.startColumn,
+                  pos.lineNumber, word.endColumn),
+              })) };
+            },
+          });
+        }
+      }
+      toast(`imported ${res.total} snippets across ${Object.keys(res.languages).length} languages`, 'ok');
+    } catch (err) {
+      toast(err.message, 'err');
+    }
+  }
+
+  function applyTheme() {
+    const light = localStorage.getItem('vanta.theme') === 'light';
+    document.body.classList.toggle('light', light);
+    if (editor) editor.updateOptions({ theme: light ? 'vanta-light' : 'vanta' });
+  }
+
+  function toggleTheme() {
+    localStorage.setItem('vanta.theme',
+      localStorage.getItem('vanta.theme') === 'light' ? 'dark' : 'light');
+    applyTheme();
+    toast('theme: ' + localStorage.getItem('vanta.theme'), 'ok');
+  }
+
   function showAbout() {
     openModal({
       title: 'Vanta IDE',
@@ -1913,8 +3297,41 @@
   function hideCtx() { $('#ctxMenu').classList.add('hidden'); }
 
   /* -------------------------------- watcher -------------------------------- */
+  async function reloadTabFromDisk(tab, mtime) {
+    if (!S.root) return;
+    const full = await api.get('/api/file', { root: S.root, path: tab.path });
+    if (full.binary || full.tooLarge) return;
+    const pos = editor ? editor.getPosition() : null;
+    tab.model.setValue(full.content);
+    if (mtime) tab.mtime = mtime;
+    tab.savedContent = full.content;
+    tab.dirty = false;
+    if (pos && S.active === tab.key) editor.setPosition(pos);
+    renderTabs();
+    toast(`${tab.name} reloaded from disk`, 'ok');
+  }
+
   async function watchFiles() {
     if (!S.root) return;
+    if (S.watch.supported) {
+      try {
+        const res = await api.get('/api/watch/poll', { since: S.watch.cursor });
+        if (!res.supported) { S.watch.supported = false; return; }
+        for (const ch of res.changes) {
+          const tab = S.tabs.find((t) => t.kind === 'file' && t.path === ch.path);
+          if (!tab || !tab.model) continue;
+          if (tab.dirty) showBanner(tab);
+          else await reloadTabFromDisk(tab, Math.round(ch.ts));
+        }
+        if (res.changes.length) {
+          S.watch.cursor = Math.max(...res.changes.map((c) => c.ts));
+          S.treeCache.clear();
+          renderTree();
+          refreshGit();
+        }
+      } catch { /* transient */ }
+      return;
+    }
     for (const tab of S.tabs) {
       if (tab.kind !== 'file' || !tab.model) continue;
       try {
@@ -1922,16 +3339,7 @@
         if (!data.mtime || data.mtime === tab.mtime) continue;
         if (tab.dirty) showBanner(tab);
         else {
-          const full = await api.get('/api/file', { root: S.root, path: tab.path });
-          if (full.binary || full.tooLarge) continue;
-          const pos = editor.getPosition();
-          tab.model.setValue(full.content);
-          tab.mtime = data.mtime;
-          tab.savedContent = full.content;
-          tab.dirty = false;
-          if (pos) editor.setPosition(pos);
-          renderTabs();
-          toast(`${tab.name} reloaded from disk`, 'ok');
+          await reloadTabFromDisk(tab, data.mtime);
         }
       } catch { /* file may have been moved */ }
     }
@@ -2045,7 +3453,12 @@
     defineTheme();
     bindTerminal();
     bindKeys();
+    bindDebugger();
     addResizers();
+    applyTheme();
+    api.get('/api/config/keybindings', { root: '' }).then((res) => {
+      keyOverrides = res.keybindings || {};
+    }).catch(() => {});
 
     try {
       const savedW = localStorage.getItem(CHAT_W_KEY);
@@ -2070,7 +3483,10 @@
       }
       $('#sbGpu').textContent = '';
       renderRecent();
-      if (env.lastRoot) await openProject(env.lastRoot);
+      if (env.lastRoot) {
+        await openProject(env.lastRoot);
+        restoreSession();
+      }
     } catch (err) {
       toast('server offline? ' + err.message, 'err');
     }
@@ -2107,6 +3523,7 @@
     setInterval(pollTerminal, 400);
     setInterval(pollAi, 900);
     setInterval(watchFiles, 4000);
+    setInterval(pollDebug, 500);
     setInterval(() => { if (S.root) refreshGit(); }, 12000);
 
     $('#tree').addEventListener('contextmenu', (e) => {
@@ -2130,8 +3547,24 @@
   }
 
   function bindKeys() {
+    const KEY_COMMANDS = {
+      quickopen: openQuickOpen, palette: openPalette,
+      search: () => setView('search'), explorer: () => setView('explorer'),
+      scm: () => setView('scm'), saveall: saveAll, save: saveActive,
+      sidebar: toggleSidebar, chat: () => setView('ai'),
+      panel: () => showPanel(!S.settings.panel),
+      close: () => S.active && closeTab(S.active), theme: toggleTheme,
+    };
+    const keyId = (e) => (e.ctrlKey || e.metaKey ? 'ctrl+' : '')
+      + (e.shiftKey ? 'shift+' : '') + e.key.toLowerCase();
     document.addEventListener('keydown', (e) => {
       if (!e.ctrlKey && !e.metaKey) return;
+      const override = keyOverrides[keyId(e)];
+      if (override && KEY_COMMANDS[override]) {
+        e.preventDefault();
+        KEY_COMMANDS[override]();
+        return;
+      }
       const k = e.key.toLowerCase();
       if (e.shiftKey && k === 'p') { e.preventDefault(); openPalette(); }
       else if (e.shiftKey && k === 'f') { e.preventDefault(); setView('search'); $('#searchInput').focus(); }
@@ -2194,16 +3627,87 @@
   });
   $('#searchRun').addEventListener('click', runSearch);
   $('#searchInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') runSearch(); });
+  $('#searchReplaceBtn').addEventListener('click', replaceAll);
   $('#searchCase').addEventListener('click', () => $('#searchCase').classList.toggle('on'));
   $('#searchRegex').addEventListener('click', () => $('#searchRegex').classList.toggle('on'));
+  $('#btnGitPull').addEventListener('click', () => gitPushPull('pull'));
+  $('#btnGitPush').addEventListener('click', () => gitPushPull('push'));
+  $('#gitBranch').addEventListener('change', () => checkoutBranch($('#gitBranch').value));
+  $('#btnGitPRs').addEventListener('click', loadPrs);
+  $('#remoteList').addEventListener('click', (e) => {
+    const row = e.target.closest('[data-kind]');
+    if (!row) return;
+    if (row.dataset.kind === 'wsl') {
+      const info = ((S.remotes || {}).wsl || []).find((w) => w.name === row.dataset.distro);
+      if (info && info.home) openProject(info.home);
+      openRemoteShell('wsl', row.dataset.distro);
+    } else {
+      api.post('/api/remotes/open', { kind: 'ssh', id: row.dataset.id, root: S.root || '' })
+        .then(() => {
+          openRemoteShell('ssh', null, row.dataset.id);
+          sshBrowseModal(row.dataset.id);
+        })
+        .catch((err) => toast(err.message, 'err'));
+    }
+  });
+  $('#btnPluginReload').addEventListener('click', reloadPlugins);
+  $('#btnUpdateCheck').addEventListener('click', checkForUpdates);  $('#gitPRs').addEventListener('click', (e) => {
+    const row = e.target.closest('[data-pr]');
+    if (row) checkoutPr(Number(row.dataset.pr));
+  });
+  $('#btnOllamaPull').addEventListener('click', pullOllamaModel);
+  $('#btnProfileSave').addEventListener('click', saveProfile);
+  $('#btnProfileDel').addEventListener('click', deleteProfile);
+  $('#chatService').addEventListener('focus', loadServices);
+  $('#chatService').addEventListener('change', onServicePick);
+  $('#btnServiceUse').addEventListener('click', applyService);
+  $('#localFit').addEventListener('click', (e) => {
+    const chip = e.target.closest('[data-model]');
+    if (!chip) return;
+    $('#chatLocalModel').value = chip.dataset.model;
+    paintLocalFit();
+  });
+  $('#editorList').addEventListener('click', (e) => {
+    const row = e.target.closest('[data-i]');
+    if (row) openInEditor(Number(row.dataset.i));
+  });
+  $('#btnImportVscode').addEventListener('click', importVscode);
+  $('#btnImportSnips').addEventListener('click', importSnippets);
+  $('#btnChatLoad').addEventListener('click', () => { loadLocalModel(); paintLocalFit(); });
+  $('#chatProfileList').addEventListener('change', () => {
+    saveChatConfig({ profile: $('#chatProfileList').value || '' });
+    paintChatTag();
+  });
+  $('#chatInstructions').addEventListener('change', () => {
+    saveChatConfig({ customInstructions: $('#chatInstructions').value });
+  });
+  $('#chatBudget').addEventListener('change', () => {
+    saveChatConfig({ contextBudget: Number($('#chatBudget').value) || 32000 });
+  });  $('#ollamaList').addEventListener('click', (e) => {
+    const row = e.target.closest('[data-model]');
+    if (row && e.target.classList.contains('ollama-del')) {
+      deleteOllamaModel(row.dataset.model);
+    }
+  });
+  $('#btnChatSettings').addEventListener('click', () => {
+    const open = $('#chatSettings').classList.toggle('hidden');
+    if (!open) { loadOllamaModels(); paintLocalFit(); loadServices(); }
+  });
 
   $('#btnChatClose').addEventListener('click', () => showChat(false));
-  $('#btnChatSettings').addEventListener('click', () => $('#chatSettings').classList.toggle('hidden'));
   $('#btnChatReset').addEventListener('click', resetChat);
   $('#btnChatSend').addEventListener('click', chatSend);
+  $('#btnChatStop').addEventListener('click', stopChat);
   $('#btnChatApply').addEventListener('click', applyChatReply);
+  bindAttachments();
   $('#chatInput').addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); chatSend(); }
+  });
+  $('#chatLog').addEventListener('click', (e) => {
+    const btn = e.target.closest('button[data-cid]');
+    if (!btn) return;
+    answerConfirm(btn.dataset.cid, btn.dataset.approve === '1');
+    btn.disabled = true;
   });
   $$('#chatProvider .seg-btn').forEach((b) =>
     b.addEventListener('click', () => setProvider(b.dataset.provider)));

@@ -26,6 +26,14 @@ await esbuild.build({
   sourcemap: false,
 });
 
+// markdown preview libs
+await esbuild.build({
+  ...common,
+  entryPoints: { 'marked': join(__dirname, 'web', 'src', 'md-entry.js') },
+  outdir: out,
+  minify: true,
+});
+
 // language service workers
 const workers = {
   editor: 'monaco-editor/editor/editor.worker.js',
