@@ -2253,7 +2253,7 @@ def _apply_replace(root: str, needle: str, use_regex: bool, case: bool,
 # --------------------------------------------------------------------------- #
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "VantaIDE/1.0"
+    server_version = "VantaIDE/1.1"
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *args):  # quiet
