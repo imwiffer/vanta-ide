@@ -234,6 +234,128 @@ Status shows in the dock header, the status bar chip, and `window.__vantaState()
 | `Alt+Z` | word wrap |
 | `F11` | fullscreen (window mode) |
 
+## Extensions & integrations
+
+**Language servers (LSP).** Configure servers in `.vanta\lsp.json` in the project:
+
+```json
+{ "python": { "command": "pyright-langserver", "args": ["--stdio"] } }
+```
+
+Diagnostics, hover, completion, and go-to-definition flow into Monaco automatically
+when a server is configured for the file's language. `tools\stub_lsp.py` is a
+minimal test server.
+
+**MCP tools.** Add Model Context Protocol servers in `.mcp.json`:
+
+```json
+{ "mcpServers": { "fs": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "."] } } }
+```
+
+Connected MCP tools appear in agent mode as `mcp:<server>:<tool>` calls and are
+routed through the harness alongside the built-in tools. Chat ⚙ shows status;
+`tools\stub_mcp.py` is a minimal test server.
+
+**Native tool calling.** OpenAI-style `tools`/`tool_calls` are used with the API
+provider when agent tools are on; ACTION-block parsing stays as the fallback.
+
+**Per-mode model routing.** In `.ai.json`, set `"models"` to route modes:
+
+```json
+{ "models": { "agent": "qwen2.5-coder:14b", "chat": "llama3.2:3b",
+              "review": { "api": "qwen2.5:32b", "local": "huihui-ai/Qwen3-4B-abliterated" } } }
+```
+
+**Git-aware context.** Workspace prompts now include branch, changed files,
+diff stat, and recent commits.
+
+**More tools:**
+- **Search & Replace All** in the search sidebar (with preview + confirm).
+- **Git push / pull / branch switching** in the SCM panel; **Pull requests** via `gh`.
+- **Database query** (SQLite, read-only) and **HTTP request** panels — palette:
+  `Tools: Database Query…`, `Tools: HTTP Request…`.
+- **Ollama model manager** in chat ⚙: list, pull, delete models on the VPS.
+- **Tasks**: define `.vanta\tasks.json` `{"tasks":[{"label":"test","command":"pytest"}]}`
+  and run from the palette.
+- **Session restore**: open tabs are saved per project and restored on launch.
+- **Markdown preview** (`Editor: Markdown Preview` command) and a **light theme**
+  (`View: Toggle Light Theme`).
+- **Keybindings**: override in `.vanta\keybindings.json`
+  (`{"ctrl+shift+f": "explorer"}` — commands: quickopen, palette, search,
+  explorer, scm, save, saveall, sidebar, chat, panel, close, theme).
+- **Image attachments** in chat (api provider) and **dictation** if
+  `faster-whisper` is installed.
+
+**Debugger.** Click the gutter to set breakpoints (red dot), then Run ▸ Debug
+Python File (or the palette command). The DEBUG panel shows the call stack,
+locals (expandable), stdout, and an expression REPL; ▶ continue, ↷ step over,
+⤵ step into, ⤴ step out, ■ stop. Powered by `debugpy` — `pip install debugpy`.
+
+**Sandbox & trust.** First-time folders ask before opening (remembered in the
+browser). With the sandbox on (chat ⚙), risky agent shell commands — format,
+recurse-delete, download-pipe-execute, registry, netsh… — pause the agent and
+show an Allow / Deny card in the chat dock until you answer (180 s timeout).
+
+**Remotes (WSL & SSH).** WSL distros are auto-detected and listed in the
+Projects panel — click to open `\\wsl$\<distro>\home\<user>` and launch a
+`wsl.exe -d` shell. SSH hosts live in `.vanta\remotes.json`
+(`{"ssh":[{"name":"vps","host":"user@1.2.3.4","port":22}]}`): click to test the
+connection, launch an `ssh` shell, and browse/edit remote files (base64
+read/write; edits save straight back to the host).
+
+**Auto-update.** "Check updates" in the Projects panel queries GitHub releases
+(`imwiffer/vanta-ide`), shows notes, stages the zip into `update-staging\`, and
+writes `apply_update.cmd`. Restart & install exits the app, swaps the files
+with robocopy, and relaunches.
+
+**Plugin API.** Drop `.py` files into `plugins\` or `<project>\.vanta\plugins\`
+defining `def register(api):` — hooks (`project_open`, `file_saved`,
+`file_deleted`, `agent_tool`, `chat_message`), custom routes under
+`/api/ext/<name>`, persisted state, and config from `.vanta\plugins.json`.
+Reload from the Projects panel. `plugins\hello.py` is a working example.
+
+**AirLLM streaming.** AirLLM generations now stream token-by-token (one layer
+pass per step) with live deltas and cancellation, instead of appearing frozen
+until done.
+
+**Virtualized tree.** Directories with 400+ entries render in chunks with a
+"▾ N more…" row, so huge folders no longer stall the first paint.
+
+**Providers in the chat dock.** Four engines behind one interface:
+`remote · Ollama VPS` (any OpenAI-compatible endpoint, multiple saved
+**profiles** with names/keys/models), **claude** (Anthropic messages API with
+native tool calling and image support), **opencode** (the OpenCode CLI runs as
+the agent in your workspace and streams into the chat), and **local · AirLLM**.
+
+**Console app.** `run-console.cmd` (or `python console.py`) is a terminal
+REPL wired to the same engine: streaming replies, agent tool events, sandbox
+confirm prompts, and `/provider /profile /model /mode /file /root /clear /save
+/exit` commands. Attaches to a running Vanta server or starts its own.
+
+**Customization.** Chat ⚙ now has **custom instructions** (appended to every
+prompt), a **context budget** (workspace-context character cap), and an
+**API profiles** manager — save/delete named endpoints and switch instantly.
+
+**IDE interop.** The Projects panel detects sibling editors (VS Code, Cursor,
+VSCodium, Zed, Sublime, Notepad++, JetBrains IDEs) — click one to open the
+current project (or active file at the cursor line) in it. One-click import
+from VS Code-family installs: user **settings** (font size, minimap, word
+wrap, theme), **keybindings** (mapped to Vanta commands), and **snippets**
+(served to Monaco as snippet completions).
+
+**AI service presets.** Chat ⚙ has a service picker: OpenAI, Groq, Mistral,
+DeepSeek, Together, OpenRouter, xAI Grok, Gemini (OpenAI-compatible endpoint),
+plus LM Studio / llama.cpp / vLLM / Ollama local servers. Each cloud service
+names an environment variable (`OPENAI_API_KEY`, `GROQ_API_KEY`, …) — set it
+and no key is ever stored in `.ai.json`; it is read at request time.
+
+**Local models on a 12 GB GPU.** The local preset list is curated for the RTX
+5070 class and every preset carries a fit note (`fp16 fits 12GB`, `4-bit fits
+12GB`, `airllm`). Opening ⚙ on the local tab shows your **free VRAM** and
+one-click "good now" chips — Qwen3-4B and Gemma-3-4B at fp16, 7B–14B coders at
+4-bit nf4 — and the worker still auto-picks engine and precision per
+checkpoint.
+
 ## Security
 
 The server listens on loopback only, but it has no authentication: anything that
