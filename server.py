@@ -2365,12 +2365,6 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/update/check":
             return json_response(self, updater.check())
 
-        if path == "/api/update/stage":
-            return json_response(self, updater.apply())
-
-        if path == "/api/update/apply":
-            return json_response(self, updater.restart_into_update())
-
         if path == "/api/remotes/list":
             here = HERE
             hosts = remotes.load_remotes(q.get("root", ""), here)
@@ -2859,6 +2853,12 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/plugins/reload":
             PLUGINS.load_all(body.get("root") or "")
             return json_response(self, {"ok": True, "plugins": PLUGINS.status()})
+
+        if path == "/api/update/stage":
+            return json_response(self, updater.apply())
+
+        if path == "/api/update/apply":
+            return json_response(self, updater.restart_into_update())
 
         if path == "/api/project/open":
             root = os.path.abspath(os.path.expandvars(os.path.expanduser(body.get("path", ""))))
