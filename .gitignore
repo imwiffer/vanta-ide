@@ -19,6 +19,10 @@ yarn-error.log*
 logs/
 .state.json
 .ai.json
+.vanta/
+.vanta-trash/
+update-staging/
+apply_update.cmd
 .vanta-trash/
 
 # OS

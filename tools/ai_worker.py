@@ -53,6 +53,7 @@ MODEL = None
 TOKENIZER = None
 ENGINE = None
 SIZE_CACHE: dict[str, int] = {}
+STOP = threading.Event()            # a running generation should halt
 
 
 def emit(**obj):
@@ -177,6 +178,15 @@ def plan_load(model_id: str, requested: str | None) -> tuple[str, str | None, st
 # chat templates
 # --------------------------------------------------------------------------- #
 
+def _content_text(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(p.get("text") or "" for p in content
+                        if isinstance(p, dict) and p.get("type") == "text")
+    return str(content or "")
+
+
 def normalize_messages(messages: list[dict]) -> list[dict]:
     """Merge leading system messages into one and ensure alternating/valid roles
     so strict Jinja templates (Mistral, Llama-3, DeepSeek, Qwen) never fail."""
@@ -185,7 +195,7 @@ def normalize_messages(messages: list[dict]) -> list[dict]:
     in_leading_sys = True
     for m in messages:
         role = m.get("role", "user")
-        content = (m.get("content") or "").strip()
+        content = _content_text(m.get("content")).strip()
         if not content:
             continue
         if role == "system" and in_leading_sys:
@@ -317,7 +327,15 @@ def load(model_id: str, compression: str | None):
 # --------------------------------------------------------------------------- #
 
 def chat_direct(messages: list[dict], max_new_tokens: int, temperature: float = 0.7) -> str:
-    from transformers import TextIteratorStreamer
+    import torch
+    from transformers import TextIteratorStreamer, StoppingCriteria, StoppingCriteriaList
+
+    class StopOnFlag(StoppingCriteria):
+        def __init__(self, event):
+            self.event = event
+
+        def __call__(self, input_ids, scores, **kwargs):
+            return self.event.is_set()
 
     enc = apply_template(messages, return_tensors="pt", return_dict=True,
                          truncation=True, max_length=16384)
@@ -330,7 +348,8 @@ def chat_direct(messages: list[dict], max_new_tokens: int, temperature: float = 
         enc = {"input_ids": enc}
     streamer = TextIteratorStreamer(TOKENIZER, skip_prompt=True,
                                     skip_special_tokens=True, timeout=600)
-    kwargs = dict(enc, max_new_tokens=max_new_tokens, streamer=streamer)
+    kwargs = dict(enc, max_new_tokens=max_new_tokens, streamer=streamer,
+                  stopping_criteria=StoppingCriteriaList([StopOnFlag(STOP)]))
     if temperature and temperature > 0.01:
         # greedy decoding makes a small model repeat itself word for word —
         # conversation needs sampling.
@@ -345,7 +364,10 @@ def chat_direct(messages: list[dict], max_new_tokens: int, temperature: float = 
             MODEL.generate(**kwargs)
         except BaseException as exc:  # noqa: BLE001
             error.append(exc)
-            streamer.end()
+            try:
+                streamer.end()
+            except Exception:  # noqa: BLE001
+                pass
 
     thread = threading.Thread(target=run, daemon=True)
     thread.start()
@@ -354,6 +376,8 @@ def chat_direct(messages: list[dict], max_new_tokens: int, temperature: float = 
         if piece:
             parts.append(piece)
             emit(type="delta", text=piece)
+        if STOP.is_set():
+            break
     thread.join(timeout=30)
     if error:
         raise error[0]
@@ -361,23 +385,49 @@ def chat_direct(messages: list[dict], max_new_tokens: int, temperature: float = 
 
 
 def chat_airllm(messages: list[dict], max_new_tokens: int, temperature: float = 0.7) -> str:
+    """Incremental generation: one token per step so the UI streams live.
+
+    AirLLM streams one layer at a time from disk, so every step re-walks the
+    layers — that per-token cost is the price of fitting big checkpoints past
+    VRAM. Deltas are emitted as they are produced; STOP halts between tokens.
+    """
+    import torch
+
     prompt = build_prompt(messages)
     tokens = TOKENIZER([prompt], return_tensors="pt", truncation=True,
                        max_length=4096, padding=False)
     device = getattr(MODEL, "device", "cpu")
-    input_ids = tokens["input_ids"].to(device)
-    gen: dict = {"max_new_tokens": max_new_tokens, "use_cache": True,
-                 "return_dict_in_generate": True}
+    seq = tokens["input_ids"].to(device)
+    new_tokens: list = []
+    eos = getattr(TOKENIZER, "eos_token_id", None)
+    sampling = {}
     if temperature and temperature > 0.01:
-        gen.update(do_sample=True, temperature=float(temperature), top_p=0.95)
-    out = MODEL.generate(input_ids, **gen)
-    new_tokens = out.sequences[0][input_ids.shape[-1]:]
+        sampling = {"do_sample": True, "temperature": float(temperature), "top_p": 0.95}
+
+    for step in range(max(int(max_new_tokens), 1)):
+        if STOP.is_set():
+            break
+        try:
+            out = MODEL.generate(seq, max_new_tokens=1, use_cache=True,
+                                 return_dict_in_generate=False, **sampling)
+        except TypeError:
+            out = MODEL.generate(seq, max_new_tokens=1, use_cache=True)
+        nxt = out[0][-1]
+        new_tokens.append(nxt)
+        seq = torch.cat([seq, nxt.reshape(1, 1).to(device)], dim=1)
+        piece = TOKENIZER.decode([nxt], skip_special_tokens=True)
+        if piece:
+            emit(type="delta", text=piece)
+        if eos is not None and int(nxt) == int(eos):
+            break
+
     return TOKENIZER.decode(new_tokens, skip_special_tokens=True).strip()
 
 
 def generate(messages: list[dict], max_new_tokens: int, temperature: float) -> str:
     if ENGINE == "direct":
         return chat_direct(messages, max_new_tokens, temperature)
+    note("airllm streaming · one token per step (layer-by-layer from disk)")
     return chat_airllm(messages, max_new_tokens, temperature)
 
 
@@ -398,12 +448,16 @@ def chat(messages: list[dict], max_new_tokens: int, temperature: float = 0.7,
         state("idle")
         return
     state("generating")
+    STOP.clear()
     started = time.time()
     convo = list(messages)
     ws = root if (root and os.path.isdir(root)) else os.getcwd()
     max_rounds = agent_tools.MAX_AGENT_STEPS if agent_enabled else 0
 
     for attempt in range(max_rounds + 1):
+        if STOP.is_set():
+            emit(type="reply", text="")
+            break
         try:
             text = generate(convo, max_new_tokens, temperature)
         except Exception as exc:  # noqa: BLE001
@@ -421,7 +475,8 @@ def chat(messages: list[dict], max_new_tokens: int, temperature: float = 0.7,
                 state("ready")
                 return
 
-        calls = agent_tools.parse_tool_calls(text) if attempt < max_rounds else []
+        calls = agent_tools.parse_tool_calls(text) if (attempt < max_rounds
+                                                       and not STOP.is_set()) else []
         if not calls:
             emit(type="reply", text=text)
             break
@@ -430,6 +485,8 @@ def chat(messages: list[dict], max_new_tokens: int, temperature: float = 0.7,
         emit(type="step", text=text)
         observations: list[str] = []
         for call in calls:
+            if STOP.is_set():
+                break
             obs = agent_tools.execute_tool(
                 call,
                 ws,
@@ -437,6 +494,9 @@ def chat(messages: list[dict], max_new_tokens: int, temperature: float = 0.7,
                 on_file_change=lambda p: emit(type="file_changed", path=p),
             )
             observations.append(obs)
+        if STOP.is_set():
+            emit(type="reply", text=text)
+            break
 
         obs_block = (
             "[Observation]\n"
@@ -509,6 +569,9 @@ def main():
                      bool(msg.get("agentTools", True)))
             elif cmd == "reset":
                 reset()
+            elif cmd == "stop":
+                STOP.set()
+                state("ready")
             else:
                 emit(type="error", msg=f"unknown cmd {cmd}")
         except Exception as exc:  # noqa: BLE001

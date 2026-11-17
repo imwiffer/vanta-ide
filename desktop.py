@@ -24,6 +24,7 @@ import argparse
 import ctypes
 import json
 import os
+import secrets
 import subprocess
 import sys
 import threading
@@ -220,6 +221,7 @@ class Shell:
         self.srv = None
         self.port = args.port
         self.url = None
+        self.token = None
         self.owns_server = False
         self.window = None
         self.destroying = False
@@ -248,7 +250,10 @@ class Shell:
         if self.srv is None:
             raise RuntimeError(f"could not bind a port: {last}")
         self.port = self.srv.server_address[1]
-        self.url = f"http://{probe_host}:{self.port}"
+        self.token = secrets.token_urlsafe(24)
+        core.AUTH_TOKEN = self.token
+        core.PLUGINS.load_all(self.args.root or core.read_state().get("lastRoot") or "")
+        self.url = f"http://{probe_host}:{self.port}/?token={self.token}"
         self.owns_server = True
         threading.Thread(target=self.srv.serve_forever, name="vanta-http", daemon=True).start()
         ts = core.tailscale_ip()
@@ -373,7 +378,7 @@ class Shell:
         time.sleep(3.0)
         # the editor only mounts a view once a model is attached
         try:
-            self.window.evaluate_js("window.__vantaOpenFile && window.__vantaOpenFile('ide/web/app.js')")
+            self.window.evaluate_js("window.__vantaOpenFile && window.__vantaOpenFile('web/app.js')")
         except Exception as exc:  # noqa: BLE001
             log(f"selftest open failed: {exc}")
         time.sleep(1.8)
@@ -519,6 +524,18 @@ class Shell:
 # entry
 # --------------------------------------------------------------------------- #
 
+def safe_print(msg: str):
+    """Console encodings (cp1252) can't print every glyph; never let a print
+    kill the process."""
+    try:
+        print(msg)
+    except UnicodeEncodeError:
+        try:
+            print(msg.encode("ascii", "replace").decode("ascii"))
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def main() -> int:
     if sys.stdout is None:  # pythonw
         sys.stdout = open(os.devnull, "w", encoding="utf-8")
@@ -529,7 +546,7 @@ def main() -> int:
     ap.add_argument("path", nargs="?", help="project folder to open")
     ap.add_argument("--root", default=None, help="project folder to open")
     ap.add_argument("--port", type=int, default=core.DEFAULT_PORT)
-    ap.add_argument("--host", default="0.0.0.0")
+    ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--width", type=int, default=DEFAULT_SIZE[0])
     ap.add_argument("--height", type=int, default=DEFAULT_SIZE[1])
     ap.add_argument("--frameless", action="store_true", help="no native frame (no OS resize edges)")
@@ -547,7 +564,7 @@ def main() -> int:
     if args.web:
         shell.ensure_server()
         webbrowser.open(shell.url)
-        print(f"Vanta IDE  →  {shell.url}   (ctrl+c to stop)")
+        safe_print(f"Vanta IDE  ->  {shell.url}   (ctrl+c to stop)")
         try:
             while True:
                 time.sleep(1)

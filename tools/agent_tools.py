@@ -444,7 +444,7 @@ def tool_read_file(root: str, args: dict) -> str:
         return f"Error: file too large ({os.path.getsize(full)} bytes): {norm_rel}"
     try:
         with open(full, "r", encoding="utf-8", errors="replace") as f:
-            all_lines = f.splitlines()
+            all_lines = f.read().splitlines()
     except OSError as exc:
         return f"Error reading {norm_rel}: {exc}"
 
